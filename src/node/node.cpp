@@ -170,10 +170,16 @@ std::string Node::send(const std::vector<Wallet::Dest>& dests, Amount fee_per_kb
     int64_t h;
     { std::lock_guard l(cs_->mu); h = cs_->height(); }
     if (!wallet_->create_tx(dests, fee_per_kb, h, tx, &fee, &err, use_backup, subtract_fee)) throw RpcError(err);
+    logf("sending %s QNT fee", format_amount(fee).c_str());
+    return broadcast(tx, note);
+}
+
+std::string Node::broadcast(const Transaction& tx, const std::string& note) {
+    std::string err;
     if (!mp_->accept(tx, &err)) throw RpcError("transaction rejected: " + err);
-    wallet_->tx_broadcast(tx, note);
+    if (wallet_) wallet_->tx_broadcast(tx, note);
     if (p2p_) p2p_->broadcast_tx(tx);
-    logf("sent tx %s (fee %s QNT)", tx.txid().hex().c_str(), format_amount(fee).c_str());
+    logf("broadcast tx %s", tx.txid().hex().c_str());
     return tx.txid().hex();
 }
 

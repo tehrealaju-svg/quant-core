@@ -227,3 +227,12 @@ TEST(node_rpc_regtest) {
     }
     { std::error_code ec; std::filesystem::remove_all(cfg.datadir, ec); }
 }
+
+TEST(bench_pow) {
+    BlockHeader h;
+    h.bits = 0x01010000; // impossible target: pure hashing
+    auto t0 = std::chrono::steady_clock::now();
+    mine_header(h, params_for(Network::Test), 2'000'000);
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("  BLAKE3 PoW: %.2f MH/s per thread\n", 2.0 / s);
+}

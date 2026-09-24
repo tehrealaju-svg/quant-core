@@ -49,6 +49,8 @@ public:
     // Send from the wallet and broadcast. Returns txid.
     std::string send(const std::vector<Wallet::Dest>& dests, Amount fee_per_kb, bool subtract_fee, const std::string& note,
                      bool use_backup = false);
+    // Broadcast a transaction already built + signed by the wallet (e.g. after a confirm dialog).
+    std::string broadcast(const Transaction& tx, const std::string& note);
     bool start_mining(int threads, const std::string& address, std::string* err);
     void stop_mining() { if (miner_) miner_->stop(); }
 
