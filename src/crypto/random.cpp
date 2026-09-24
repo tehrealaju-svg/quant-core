@@ -13,7 +13,7 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
-#if defined(__linux__) || defined(__ANDROID__)
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <sys/random.h>
 #endif
 #endif
@@ -26,7 +26,7 @@ void os_random(uint8_t* out, size_t n) {
         throw std::runtime_error("BCryptGenRandom failed");
 #else
     size_t got = 0;
-#if defined(__linux__) || defined(__ANDROID__)
+#if defined(__linux__) && !defined(__ANDROID__)
     while (got < n) {
         ssize_t r = getrandom(out + got, n - got, 0);
         if (r <= 0) break;
