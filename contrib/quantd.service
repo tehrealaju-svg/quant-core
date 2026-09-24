@@ -1,0 +1,15 @@
+# systemd unit for a Raspberry Pi / Linux node.
+# Install: sudo cp contrib/quantd.service /etc/systemd/system/ && sudo systemctl enable --now quantd
+[Unit]
+Description=Quant full node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+ExecStart=/home/pi/quant-core/build/quantd -testnet
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
