@@ -81,17 +81,20 @@ static bool bdec(const std::string& in, size_t& p, BVal& out, int depth) {
     return false;
 }
 
-static std::string compact_addr(const NetAddr& a) {
-    std::string s(6, '\0');
-    s[0] = char(a.ip >> 24); s[1] = char(a.ip >> 16); s[2] = char(a.ip >> 8); s[3] = char(a.ip);
-    s[4] = char(a.port >> 8); s[5] = char(a.port);
+static std::string compact_addr(const NetAddr& a, bool v6) {
+    std::string s;
+    if (v6) s.assign((const char*)a.ip.data(), 16);
+    else s.assign((const char*)a.ip.data() + 12, 4);
+    s += char(a.port >> 8);
+    s += char(a.port);
     return s;
 }
-static NetAddr parse_compact(const std::string& s, size_t off) {
+static NetAddr parse_compact(const std::string& s, size_t off, bool v6) {
     const uint8_t* b = (const uint8_t*)s.data() + off;
     NetAddr a;
-    a.ip = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
-    a.port = uint16_t(b[4] << 8 | b[5]);
+    if (v6) { std::memcpy(a.ip.data(), b, 16); b += 16; }
+    else a = NetAddr::v4(uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3], 0), b += 4;
+    a.port = uint16_t(b[0] << 8 | b[1]);
     return a;
 }
 static std::string xor_dist(const std::string& a, const std::string& b) {
@@ -101,8 +104,9 @@ static std::string xor_dist(const std::string& a, const std::string& b) {
 }
 
 // ---------------------------------------------------------------- Dht
-Dht::Dht(const uint8_t infohash[20], uint16_t udp_port, uint16_t announce_port, const std::string& state_path)
-    : infohash_((const char*)infohash, 20), port_(udp_port), announce_port_(announce_port), state_path_(state_path) {
+Dht::Dht(const uint8_t infohash[20], uint16_t udp_port, uint16_t announce_port, const std::string& state_path, bool ipv6)
+    : infohash_((const char*)infohash, 20), port_(udp_port), announce_port_(announce_port), v6_(ipv6),
+      fam_(ipv6 ? AF_INET6 : AF_INET), alen_(ipv6 ? 18 : 6), nodes_key_(ipv6 ? "nodes6" : "nodes"), state_path_(state_path) {
     Hash256 r = random_hash();
     my_id_.assign((const char*)r.data(), 20);
     secret_.assign((const char*)random_hash().data(), 32);
@@ -120,7 +124,7 @@ Dht::Dht(const uint8_t infohash[20], uint16_t udp_port, uint16_t announce_port, 
             size_t cnt = rd.varint_max(1000);
             for (size_t i = 0; i < cnt; i++) {
                 Bytes nid = rd.raw(20);
-                NetAddr a; a.ip = rd.u32le(); a.port = uint16_t(rd.u32le());
+                NetAddr a; rd.raw(a.ip.data(), 16); a.port = uint16_t(rd.u32le());
                 add_node(std::string(nid.begin(), nid.end()), a);
             }
         } catch (...) {}
@@ -136,29 +140,29 @@ void Dht::save() {
     for (auto& [id, n] : nodes_) if (n.fails == 0) good.push_back(n);
     if (good.size() > 300) good.resize(300);
     w.varint(good.size());
-    for (auto& n : good) { w.raw((const uint8_t*)n.id.data(), 20); w.u32le(n.addr.ip); w.u32le(n.addr.port); }
+    for (auto& n : good) { w.raw((const uint8_t*)n.id.data(), 20); w.raw(n.addr.ip.data(), 16); w.u32le(n.addr.port); }
     FILE* f = fopen(state_path_.c_str(), "wb");
     if (f) { fwrite(w.buf.data(), 1, w.buf.size(), f); fclose(f); }
 }
 
 bool Dht::start(std::string* err) {
-    sock_ = udp_bind(port_, false, err);
+    sock_ = v6_ ? udp_bind6(port_, err) : udp_bind(port_, false, err);
     return sock_ != BAD_SOCK;
 }
 
 std::string Dht::status() const {
-    return std::to_string(nodes_.size()) + " DHT nodes, " + std::to_string(found_.size()) + " Quant peers found" +
+    return std::string(v6_ ? "IPv6: " : "IPv4: ") + std::to_string(nodes_.size()) + " DHT nodes, " + std::to_string(found_.size()) + " Quant peers found" +
            (lookup_active_ ? " (searching)" : "");
 }
 
 std::string Dht::token_for(const NetAddr& a) const {
-    std::string s = secret_ + compact_addr(a);
+    std::string s = secret_ + compact_addr(a, true);
     Hash256 h = blake3((const uint8_t*)s.data(), s.size());
     return std::string((const char*)h.data(), 8);
 }
 
 void Dht::add_node(const std::string& id, const NetAddr& a) {
-    if (id.size() != 20 || id == my_id_ || !a.routable()) return;
+    if (id.size() != 20 || id == my_id_ || !a.routable() || a.is_v4() == v6_) return;
     auto& n = nodes_[id];
     n.id = id;
     n.addr = a;
@@ -188,6 +192,7 @@ void Dht::send_query(const NetAddr& to, const std::string& q, const std::map<std
     a.d["id"] = BVal(my_id_);
     for (auto& [k, v] : args) {
         if (k == "port" || k == "implied_port") a.d[k] = BVal(int64_t(std::stoll(v)));
+        else if (k == "want") { BVal l; l.t = BVal::List; l.l.push_back(BVal(v)); a.d[k] = l; }
         else a.d[k] = BVal(v);
     }
     BVal m = BVal::dict();
@@ -197,8 +202,7 @@ void Dht::send_query(const NetAddr& to, const std::string& q, const std::map<std
     m.d["a"] = a;
     std::string out;
     benc(m, out);
-    sockaddr_in sa = to.to_sockaddr();
-    sendto(sock_, out.data(), int(out.size()), 0, (sockaddr*)&sa, sizeof sa);
+    udp_send(sock_, fam_, to, out.data(), out.size());
     pending_[t] = lookup;
     if (pending_.size() > 4000) pending_.erase(pending_.begin());
 }
@@ -210,8 +214,8 @@ void Dht::bootstrap() {
         {"router.utorrent.com", 6881}, {"dht.libtorrent.org", 25401},
     };
     for (auto& [h, p] : routers)
-        for (auto& a : resolve(h, p)) send_query(a, "find_node", {{"target", my_id_}}, false);
-    for (auto& n : closest(my_id_, 16)) send_query(n.addr, "find_node", {{"target", my_id_}}, false);
+        for (auto& a : resolve(h, p, fam_)) send_query(a, "find_node", {{"target", my_id_}, {"want", v6_ ? "n6" : "n4"}}, false);
+    for (auto& n : closest(my_id_, 16)) send_query(n.addr, "find_node", {{"target", my_id_}, {"want", v6_ ? "n6" : "n4"}}, false);
 }
 
 void Dht::start_lookup() {
@@ -231,7 +235,7 @@ void Dht::step_lookup() {
         if (++window > 24) break;
         if (n->queried) continue;
         n->queried = true;
-        send_query(n->addr, "get_peers", {{"info_hash", infohash_}}, true);
+        send_query(n->addr, "get_peers", {{"info_hash", infohash_}, {"want", v6_ ? "n6" : "n4"}}, true);
         if (++sent >= 4) break;
     }
     bool pending_close = false;
@@ -267,7 +271,7 @@ void Dht::tick(int64_t now) {
 void Dht::on_readable() {
     char buf[2048];
     for (int k = 0; k < 64; k++) {
-        sockaddr_in from{};
+        sockaddr_storage from{};
         socklen_t fl = sizeof from;
         int n = int(recvfrom(sock_, buf, sizeof buf, 0, (sockaddr*)&from, &fl));
         if (n <= 0) return;
@@ -275,7 +279,7 @@ void Dht::on_readable() {
         size_t p = 0;
         BVal m;
         if (!bdec(s, p, m, 0) || m.t != BVal::Dict) continue;
-        handle(m, NetAddr::from_sockaddr(from));
+        handle(m, NetAddr::from_sockaddr((sockaddr*)&from));
     }
 }
 
@@ -293,11 +297,11 @@ void Dht::handle(const BVal& m, const NetAddr& from) {
         const std::string* id = r->str("id");
         if (!id || id->size() != 20) return;
         add_node(*id, from);
-        if (const std::string* ip = m.str("ip"); ip && ip->size() == 6 && on_my_ip) on_my_ip(parse_compact(*ip, 0));
-        if (const std::string* nodes = r->str("nodes")) {
-            for (size_t o = 0; o + 26 <= nodes->size(); o += 26) {
+        if (const std::string* ip = m.str("ip"); ip && ip->size() == alen_ && on_my_ip) on_my_ip(parse_compact(*ip, 0, v6_));
+        if (const std::string* nodes = r->str(nodes_key_)) {
+            for (size_t o = 0; o + 20 + alen_ <= nodes->size(); o += 20 + alen_) {
                 std::string nid = nodes->substr(o, 20);
-                NetAddr a = parse_compact(*nodes, o + 20);
+                NetAddr a = parse_compact(*nodes, o + 20, v6_);
                 add_node(nid, a);
                 if (is_lookup && lookup_active_ && a.routable() && nid != my_id_ && !lookup_.count(nid))
                     lookup_[nid] = LookupNode{nid, a};
@@ -311,8 +315,8 @@ void Dht::handle(const BVal& m, const NetAddr& from) {
             }
             if (const BVal* vals = r->get("values"); vals && vals->t == BVal::List) {
                 for (auto& v : vals->l) {
-                    if (v.t != BVal::Str || v.s.size() != 6) continue;
-                    NetAddr a = parse_compact(v.s, 0);
+                    if (v.t != BVal::Str || v.s.size() != alen_) continue;
+                    NetAddr a = parse_compact(v.s, 0, v6_);
                     if (a.port == 0) continue;
                     bool fresh = found_.insert(a).second;
                     if (fresh) logf("DHT: found Quant peer %s", a.str().c_str());
@@ -334,24 +338,24 @@ void Dht::handle(const BVal& m, const NetAddr& from) {
     r.d["id"] = BVal(my_id_);
     auto nodes_for = [&](const std::string& target) {
         std::string c;
-        for (auto& n : closest(target, 8)) c += n.id + compact_addr(n.addr);
+        for (auto& n : closest(target, 8)) c += n.id + compact_addr(n.addr, v6_);
         return c;
     };
     if (*q == "ping") {
     } else if (*q == "find_node") {
         const std::string* target = a->str("target");
         if (!target || target->size() != 20) return;
-        r.d["nodes"] = BVal(nodes_for(*target));
+        r.d[nodes_key_] = BVal(nodes_for(*target));
     } else if (*q == "get_peers") {
         const std::string* ih = a->str("info_hash");
         if (!ih || ih->size() != 20) return;
         r.d["token"] = BVal(token_for(from));
         if (*ih == infohash_ && !stored_peers_.empty()) {
             BVal l; l.t = BVal::List;
-            for (auto& p : stored_peers_) l.l.push_back(BVal(compact_addr(p)));
+            for (auto& p : stored_peers_) l.l.push_back(BVal(compact_addr(p, v6_)));
             r.d["values"] = l;
         } else {
-            r.d["nodes"] = BVal(nodes_for(*ih));
+            r.d[nodes_key_] = BVal(nodes_for(*ih));
         }
     } else if (*q == "announce_peer") {
         const std::string* ih = a->str("info_hash");
@@ -376,11 +380,10 @@ void Dht::handle(const BVal& m, const NetAddr& from) {
     resp.d["t"] = BVal(*t);
     resp.d["y"] = BVal(std::string("r"));
     resp.d["r"] = r;
-    resp.d["ip"] = BVal(compact_addr(from));
+    resp.d["ip"] = BVal(compact_addr(from, v6_));
     std::string out;
     benc(resp, out);
-    sockaddr_in sa = from.to_sockaddr();
-    sendto(sock_, out.data(), int(out.size()), 0, (sockaddr*)&sa, sizeof sa);
+    udp_send(sock_, fam_, from, out.data(), out.size());
 }
 
 } // namespace quant

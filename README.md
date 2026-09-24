@@ -9,7 +9,8 @@ command-line client (`quant-cli`) and the shared library used by the desktop cli
 * **BLAKE3** hashing and proof-of-work, 2-minute blocks, difficulty adjusted every block
 * **50 QNT** reward, halving every **8 years**, ~210.24M max, 10 decimal places, no premine
 * **Signature pruning** — signatures deleted after ~1 week; ~116 bytes stored per payment
-* **No servers** — peers found through the BitTorrent DHT, LAN broadcast and saved peers
+* **No servers** — peers found through the BitTorrent DHT (IPv4 + IPv6), LAN broadcast and saved peers
+* **Works behind Starlink / mobile CGNAT** — IPv6 makes your node reachable without port forwarding
 * Minimum fee 0.00001 QNT/KB (≈0.00002 QNT per payment), minimum amount 0.000001 QNT
 
 Design: [docs/WHITEPAPER.md](docs/WHITEPAPER.md) · Mainnet launch: [LAUNCH.md](LAUNCH.md)

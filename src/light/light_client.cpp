@@ -247,12 +247,16 @@ std::vector<NetAddr> LightClient::discover(int timeout_s, size_t enough) {
         sa.sin_port = htons(p_.lan_port);
         sendto(lan, (const char*)q.data(), int(q.size()), 0, (sockaddr*)&sa, sizeof sa);
     }
-    std::unique_ptr<Dht> dht;
+    std::vector<std::unique_ptr<Dht>> dhts;
     if (found.size() < enough) {
-        dht = std::make_unique<Dht>(p_.dht_infohash, 0, 0, dir_ + "/dht.dat");
-        dht->announce = false;
-        if (!dht->start(nullptr)) dht.reset();
-        else dht->on_peer = [&](const NetAddr& a) { found.insert(a); };
+        for (bool v6 : {false, true}) {
+            if (v6 && !net_ipv6_available()) continue;
+            auto d = std::make_unique<Dht>(p_.dht_infohash, 0, 0, dir_ + (v6 ? "/dht6.dat" : "/dht4.dat"), v6);
+            d->announce = false;
+            if (!d->start(nullptr)) continue;
+            d->on_peer = [&](const NetAddr& a) { found.insert(a); };
+            dhts.push_back(std::move(d));
+        }
         if (on_status) on_status("searching the BitTorrent DHT for Quant nodes...");
     }
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
@@ -260,26 +264,26 @@ std::vector<NetAddr> LightClient::discover(int timeout_s, size_t enough) {
     while (std::chrono::steady_clock::now() < deadline) {
         std::vector<pollfd_t> fds;
         if (lan != BAD_SOCK) { pollfd_t f{}; f.fd = lan; f.events = POLLIN; fds.push_back(f); }
-        if (dht) { pollfd_t f{}; f.fd = dht->fd(); f.events = POLLIN; fds.push_back(f); }
+        for (auto& d : dhts) { pollfd_t f{}; f.fd = d->fd(); f.events = POLLIN; fds.push_back(f); }
         if (fds.empty()) break;
         sock_poll(fds.data(), fds.size(), 100);
         if (lan != BAD_SOCK) {
             uint8_t buf[64];
-            sockaddr_in from{};
+            sockaddr_storage from{};
             socklen_t fl = sizeof from;
             int n = int(recvfrom(lan, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl));
             if (n == 20 && std::memcmp(buf, "QNTL", 4) == 0 && std::memcmp(buf + 4, p_.magic, 4) == 0) {
                 Reader r(buf + 8, 12);
-                NetAddr a{NetAddr::from_sockaddr(from).ip, uint16_t(r.u32le())};
+                NetAddr a = NetAddr::from_sockaddr((sockaddr*)&from).with_port(uint16_t(r.u32le()));
                 if (found.insert(a).second) { lan_found++; if (on_status) on_status("found node on local network: " + a.str()); }
             }
         }
-        if (dht) { dht->on_readable(); dht->tick(now_millis()); }
+        for (auto& d : dhts) { d->on_readable(); d->tick(now_millis()); }
         bool lan_window_over = std::chrono::steady_clock::now() > deadline - std::chrono::seconds(std::max(timeout_s - 2, 0));
         if (found.size() >= enough && lan_window_over) break;
         (void)lan_found;
     }
-    if (dht) dht->save();
+    for (auto& d : dhts) d->save();
     sock_close(lan);
     return std::vector<NetAddr>(found.begin(), found.end());
 }

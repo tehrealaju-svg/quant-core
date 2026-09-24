@@ -101,16 +101,17 @@ private:
     std::thread th_;
 
     sock_t listen_ = BAD_SOCK, lan_ = BAD_SOCK;
-    std::unique_ptr<Dht> dht_;
+    std::vector<std::unique_ptr<Dht>> dhts_;
     std::unique_ptr<PortMapper> upnp_;
     std::vector<std::unique_ptr<Peer>> peers_;
     uint64_t next_peer_id_ = 1;
     std::map<NetAddr, AddrInfo> addrs_;
-    std::map<uint32_t, int64_t> banned_; // ip -> until (seconds)
+    std::map<std::array<uint8_t, 16>, int64_t> banned_; // ip -> until (seconds)
     std::map<Hash256, std::pair<uint64_t, int64_t>> inflight_; // block -> (peer, since ms)
     std::set<std::pair<Hash256, uint64_t>> no_witness_;       // (block, peer) peer couldn't give witness
     std::map<NetAddr, int> external_votes_;
-    NetAddr external_;
+    NetAddr external4_, external6_;
+    std::set<NetAddr> self_addrs_;
     int64_t last_lan_ = 0, last_save_ = 0, last_announce_height_ = -1;
 
     // cross-thread queues

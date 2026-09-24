@@ -67,12 +67,16 @@ bool P2P::start(std::string* err) {
         if (listen_ == BAD_SOCK) { if (err) *err = e; return false; }
     }
     if (opt_.dht && !opt_.connect_only) {
-        dht_ = std::make_unique<Dht>(p_.dht_infohash, opt_.port, opt_.port, opt_.datadir + "/dht.dat");
-        std::string e;
-        if (!dht_->start(&e)) { logf("DHT disabled: %s", e.c_str()); dht_.reset(); }
-        else {
-            dht_->on_peer = [this](const NetAddr& a) { add_addr(a); };
-            dht_->on_my_ip = [this](const NetAddr& a) { learned_external(NetAddr{a.ip, opt_.port}); };
+        // Two DHTs: the IPv4 one and the IPv6 one (BEP 32). On IPv4-CGNAT connections such as
+        // Starlink or mobile data, the IPv6 DHT is how other nodes find a reachable address for us.
+        for (bool v6 : {false, true}) {
+            if (v6 && !net_ipv6_available()) continue;
+            auto d = std::make_unique<Dht>(p_.dht_infohash, opt_.port, opt_.port, opt_.datadir + (v6 ? "/dht6.dat" : "/dht4.dat"), v6);
+            std::string e;
+            if (!d->start(&e)) { logf("DHT (%s) disabled: %s", v6 ? "IPv6" : "IPv4", e.c_str()); continue; }
+            d->on_peer = [this](const NetAddr& a) { add_addr(a); };
+            d->on_my_ip = [this](const NetAddr& a) { learned_external(a.with_port(opt_.port)); };
+            dhts_.push_back(std::move(d));
         }
     }
     if (opt_.lan && !opt_.connect_only) {
@@ -99,8 +103,8 @@ void P2P::stop() {
     sock_close(listen_);
     sock_close(lan_);
     listen_ = lan_ = BAD_SOCK;
-    if (dht_) dht_->save();
-    dht_.reset();
+    for (auto& d : dhts_) d->save();
+    dhts_.clear();
     upnp_.reset();
     save_addrs();
 }
@@ -114,8 +118,8 @@ NetStats P2P::stats() const { std::lock_guard l(info_mu_); return stats_; }
 
 // ---------------------------------------------------------------- address book
 void P2P::add_addr(const NetAddr& a, bool manual) {
-    if (a.port == 0 || a.ip == 0) return;
-    if (a == external_) return;
+    if (a.port == 0 || a.is_zero()) return;
+    if (a == external4_ || a == external6_) return;
     auto& info = addrs_[a];
     if (manual) info.manual = true;
     if (addrs_.size() > 5000) {
@@ -155,8 +159,9 @@ void P2P::learned_external(const NetAddr& a) {
     if (!a.routable()) return;
     int& v = external_votes_[a];
     v++;
-    if (v >= 2 && !(external_ == a)) {
-        external_ = a;
+    NetAddr& ext = a.is_v4() ? external4_ : external6_;
+    if (v >= 2 && !(ext == a)) {
+        ext = a;
         addrs_.erase(a);
         logf("our public address appears to be %s", a.str().c_str());
     }
@@ -167,6 +172,7 @@ void P2P::connect_to(const NetAddr& a, bool manual) {
     for (auto& p : peers_) if (p->addr == a && !p->inbound) return;
     auto ban = banned_.find(a.ip);
     if (ban != banned_.end() && ban->second > now_seconds() && !manual) return;
+    if (!a.is_v4() && !net_ipv6_available()) return;
     sock_t s = tcp_connect_nb(a);
     auto& info = addrs_[a];
     info.last_try = now_seconds();
@@ -185,11 +191,11 @@ void P2P::connect_to(const NetAddr& a, bool manual) {
 
 void P2P::accept_inbound() {
     for (int i = 0; i < 16; i++) {
-        sockaddr_in sa{};
+        sockaddr_storage sa{};
         socklen_t len = sizeof sa;
         sock_t s = ::accept(listen_, (sockaddr*)&sa, &len);
         if (s == BAD_SOCK) return;
-        NetAddr a = NetAddr::from_sockaddr(sa);
+        NetAddr a = NetAddr::from_sockaddr((sockaddr*)&sa);
         int inbound = 0;
         for (auto& p : peers_) inbound += p->inbound;
         auto ban = banned_.find(a.ip);
@@ -305,7 +311,7 @@ void P2P::handle(Peer& p, Cmd c, const Bytes& payload) {
         if (p.ver.genesis != p_.genesis_hash) { misbehave(p, "different network (genesis mismatch)", false); return; }
         if (p.ver.nonce == nonce_) {
             // Connected to ourselves: remember that address so we never try it again.
-            external_ = p.inbound ? external_ : p.addr;
+            if (!p.inbound) self_addrs_.insert(p.addr);
             addrs_.erase(p.addr);
             p.disconnect = true;
             return;
@@ -318,10 +324,10 @@ void P2P::handle(Peer& p, Cmd c, const Bytes& payload) {
         p.got_version = true;
         p.best_height = p.ver.height;
         if (p.inbound) {
-            if (p.ver.listen_port) add_addr(NetAddr{p.addr.ip, p.ver.listen_port});
+            if (p.ver.listen_port) add_addr(p.addr.with_port(p.ver.listen_port));
             on_connected(p);
         }
-        learned_external(NetAddr{p.ver.your_addr.ip, opt_.port});
+        learned_external(p.ver.your_addr.with_port(opt_.port));
         send(p, Cmd::Verack, {});
         break;
     }
@@ -339,11 +345,17 @@ void P2P::handle(Peer& p, Cmd c, const Bytes& payload) {
             send_getheaders(p, true);
         }
         // Tell the peer about our own address when we're reachable.
-        bool reachable = (upnp_ && upnp_->mapped()) || std::any_of(peers_.begin(), peers_.end(), [](auto& x) { return x->inbound && x->addr.routable(); });
-        if (reachable && external_.routable()) {
+        // Tell the peer our own addresses. IPv6 is usually directly reachable (no NAT), so we
+        // always advertise it; IPv4 only when we know inbound works (UPnP or seen inbound peers).
+        bool reach4 = (upnp_ && upnp_->mapped()) ||
+                      std::any_of(peers_.begin(), peers_.end(), [](auto& x) { return x->inbound && x->addr.is_v4() && x->addr.routable(); });
+        std::vector<NetAddr> mine;
+        if (reach4 && external4_.routable()) mine.push_back(external4_);
+        if (opt_.listen && external6_.routable()) mine.push_back(external6_);
+        if (!mine.empty()) {
             Writer w;
-            w.varint(1);
-            w.u32le(external_.ip); w.u32le(external_.port); w.u64le(uint64_t(now_seconds()));
+            w.varint(mine.size());
+            for (auto& a : mine) { write_addr(w, a); w.u64le(uint64_t(now_seconds())); }
             send(p, Cmd::Addr, w.buf);
         }
         break;
@@ -362,16 +374,14 @@ void P2P::handle(Peer& p, Cmd c, const Bytes& payload) {
         if (v.size() > 500) v.resize(500);
         Writer w;
         w.varint(v.size());
-        for (auto& a : v) { w.u32le(a.ip); w.u32le(a.port); w.u64le(uint64_t(addrs_[a].last_ok)); }
+        for (auto& a : v) { write_addr(w, a); w.u64le(uint64_t(addrs_[a].last_ok)); }
         send(p, Cmd::Addr, w.buf);
         break;
     }
     case Cmd::Addr: {
         size_t n = r.varint_max(1000);
         for (size_t i = 0; i < n; i++) {
-            NetAddr a;
-            a.ip = r.u32le();
-            a.port = uint16_t(r.u32le());
+            NetAddr a = read_addr(r);
             r.u64le();
             if (a.routable() || (a.is_local() && p.addr.is_local())) add_addr(a);
         }
@@ -640,7 +650,7 @@ void P2P::lan_tick(int64_t now) {
 void P2P::lan_read() {
     uint8_t buf[256];
     for (int k = 0; k < 32; k++) {
-        sockaddr_in from{};
+        sockaddr_storage from{};
         socklen_t fl = sizeof from;
         int n = int(recvfrom(lan_, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl));
         if (n <= 0) return;
@@ -651,7 +661,7 @@ void P2P::lan_read() {
             w.raw(p_.magic, 4);
             w.u32le(opt_.port);
             w.u64le(nonce_);
-            sendto(lan_, (const char*)w.buf.data(), int(w.buf.size()), 0, (sockaddr*)&from, sizeof from);
+            sendto(lan_, (const char*)w.buf.data(), int(w.buf.size()), 0, (sockaddr*)&from, fl);
             continue;
         }
         if (n != 20 || std::memcmp(buf, "QNTL", 4) != 0 || std::memcmp(buf + 4, p_.magic, 4) != 0) continue;
@@ -659,7 +669,7 @@ void P2P::lan_read() {
         uint16_t port = uint16_t(r.u32le());
         uint64_t nonce = r.u64le();
         if (nonce == nonce_) continue;
-        NetAddr a{NetAddr::from_sockaddr(from).ip, port};
+        NetAddr a = NetAddr::from_sockaddr((sockaddr*)&from).with_port(port);
         bool known = addrs_.count(a);
         add_addr(a);
         if (!known) {
@@ -767,7 +777,7 @@ void P2P::maintain(int64_t now) {
         std::vector<NetAddr> cands;
         int64_t t = now_seconds();
         for (auto& [a, info] : addrs_) {
-            if (a == external_) continue;
+            if (a == external4_ || a == external6_ || self_addrs_.count(a)) continue;
             int64_t backoff = std::min<int64_t>(60LL << std::min(info.attempts, 6), 3600);
             if (info.last_try && t - info.last_try < backoff) continue;
             bool connected = std::any_of(peers_.begin(), peers_.end(), [&](auto& p) { return p->addr == a; });
@@ -778,9 +788,9 @@ void P2P::maintain(int64_t now) {
         for (size_t i = 0; i < cands.size() && outbound < opt_.max_outbound && i < 4; i++, outbound++) connect_to(cands[i], false);
     }
     request_blocks(now);
-    if (dht_) dht_->tick(now);
+    for (auto& d : dhts_) d->tick(now);
     lan_tick(now);
-    if (now - last_save_ > 5 * 60000) { last_save_ = now; save_addrs(); if (dht_) dht_->save(); }
+    if (now - last_save_ > 5 * 60000) { last_save_ = now; save_addrs(); for (auto& d : dhts_) d->save(); }
 }
 
 void P2P::publish_info() {
@@ -798,10 +808,13 @@ void P2P::publish_info() {
     s.bytes_in = bytes_in_;
     s.bytes_out = bytes_out_;
     s.known_addrs = addrs_.size();
-    s.dht_status = dht_ ? dht_->status() : "off";
+    s.dht_status.clear();
+    for (auto& d : dhts_) s.dht_status += (s.dht_status.empty() ? "" : "  |  ") + d->status();
+    if (s.dht_status.empty()) s.dht_status = "off";
     s.upnp_status = upnp_ ? upnp_->status() : "off";
     s.lan_status = lan_ != BAD_SOCK ? "broadcasting on UDP " + std::to_string(p_.lan_port) : "off";
-    s.external_addr = external_.ip ? external_.str() : "unknown";
+    s.external_addr = external4_.is_zero() ? "IPv4 unknown" : external4_.str();
+    s.external_addr += external6_.is_zero() ? "  |  IPv6 unknown" : "  |  " + external6_.str();
     s.listening = listen_ != BAD_SOCK;
     peer_count_ = v.size();
     std::lock_guard l(info_mu_);
@@ -824,7 +837,7 @@ void P2P::loop() {
             fdpeer.push_back(p);
         };
         if (listen_ != BAD_SOCK) addfd(listen_, POLLIN, nullptr);
-        if (dht_) addfd(dht_->fd(), POLLIN, nullptr);
+        for (auto& d : dhts_) addfd(d->fd(), POLLIN, nullptr);
         if (lan_ != BAD_SOCK) addfd(lan_, POLLIN, nullptr);
         for (auto& p : peers_) {
             short ev = POLLIN;
@@ -841,7 +854,7 @@ void P2P::loop() {
                 Peer* p = fdpeer[i];
                 if (!p) {
                     if (fds[i].fd == listen_) accept_inbound();
-                    else if (dht_ && fds[i].fd == dht_->fd()) dht_->on_readable();
+                    else if (auto it = std::find_if(dhts_.begin(), dhts_.end(), [&](auto& d) { return d->fd() == fds[i].fd; }); it != dhts_.end()) (*it)->on_readable();
                     else if (fds[i].fd == lan_) lan_read();
                     continue;
                 }

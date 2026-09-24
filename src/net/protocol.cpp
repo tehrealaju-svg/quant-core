@@ -20,7 +20,7 @@ Bytes VersionMsg::encode() const {
     Writer w;
     w.u32le(version); w.u64le(services); w.u64le(nonce); w.u64le(uint64_t(height));
     w.u32le(listen_port); w.str(agent); w.hash(genesis);
-    w.u32le(your_addr.ip); w.u32le(your_addr.port);
+    write_addr(w, your_addr);
     return w.buf;
 }
 
@@ -28,7 +28,7 @@ VersionMsg VersionMsg::decode(Reader& r) {
     VersionMsg v;
     v.version = r.u32le(); v.services = r.u64le(); v.nonce = r.u64le(); v.height = int64_t(r.u64le());
     v.listen_port = uint16_t(r.u32le()); v.agent = r.str(256); v.genesis = r.hash();
-    v.your_addr.ip = r.u32le(); v.your_addr.port = uint16_t(r.u32le());
+    v.your_addr = read_addr(r);
     return v;
 }
 
@@ -55,6 +55,9 @@ UtxoProof UtxoProof::read(Reader& r) {
     for (size_t i = 0; i < n; i++) u.merkle.push_back(r.hash());
     return u;
 }
+
+void write_addr(Writer& w, const NetAddr& a) { w.raw(a.ip.data(), 16); w.u8(uint8_t(a.port >> 8)); w.u8(uint8_t(a.port)); }
+NetAddr read_addr(Reader& r) { NetAddr a; r.raw(a.ip.data(), 16); a.port = uint16_t(r.u8() << 8); a.port |= r.u8(); return a; }
 
 Bytes frame_message(const ChainParams& p, Cmd cmd, const Bytes& payload) {
     Hash256 c = blake3_tagged(ctx::NETCHECK, payload);

@@ -7,7 +7,7 @@
 
 namespace quant {
 
-constexpr uint32_t PROTOCOL_VERSION = 1;
+constexpr uint32_t PROTOCOL_VERSION = 2; // 2: IPv6 addresses
 constexpr size_t MAX_MESSAGE = 4 * 1024 * 1024;
 constexpr size_t FRAME_HEADER = 13;
 constexpr size_t MAX_HEADERS_PER_MSG = 2000;
@@ -49,6 +49,9 @@ struct UtxoProof {
     static UtxoProof read(Reader& r);
 };
 
+// 16-byte address (IPv4-mapped for IPv4) + big-endian port.
+void write_addr(Writer& w, const NetAddr& a);
+NetAddr read_addr(Reader& r);
 Bytes frame_message(const ChainParams& p, Cmd cmd, const Bytes& payload);
 
 // Incremental frame parser.

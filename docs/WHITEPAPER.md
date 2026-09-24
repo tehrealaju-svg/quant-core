@@ -95,7 +95,7 @@ Bitcoin Core ships DNS seeds, a few hostnames run by developers. Quant ships non
 4. gossips addresses with every peer (`getaddr`/`addr`);
 5. accepts manual `addnode` as a last resort.
 
-Nodes also forward their own port via UPnP where the router allows it. The only outside
+Nodes listen on IPv4 **and IPv6** and use both the IPv4 and IPv6 DHTs (BEP 32). Many home and mobile connections (Starlink, 4G/5G) put IPv4 behind carrier-grade NAT with no port forwarding, but give every device a public IPv6 address, so those nodes are still reachable over IPv6. Where the router allows it, nodes also forward their IPv4 port with UPnP. The only outside
 contacts are the generic DHT bootstrap routers, and only on a node's very first run; after that
 it remembers DHT nodes itself.
 

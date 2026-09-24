@@ -18,7 +18,7 @@ struct BVal; // bencode value
 
 class Dht {
 public:
-    Dht(const uint8_t infohash[20], uint16_t udp_port, uint16_t announce_port, const std::string& state_path);
+    Dht(const uint8_t infohash[20], uint16_t udp_port, uint16_t announce_port, const std::string& state_path, bool ipv6 = false);
     ~Dht();
 
     bool start(std::string* err);
@@ -52,6 +52,10 @@ private:
 
     std::string infohash_, my_id_;
     uint16_t port_, announce_port_;
+    bool v6_;
+    int fam_;
+    size_t alen_;   // compact address length: 6 (IPv4) or 18 (IPv6)
+    std::string nodes_key_;
     std::string state_path_;
     sock_t sock_ = BAD_SOCK;
     std::map<std::string, Node> nodes_;     // by id
