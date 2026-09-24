@@ -247,7 +247,7 @@ void Dht::finish_lookup() {
     std::sort(v.begin(), v.end(), [&](auto* a, auto* b) { return xor_dist(a->id, infohash_) < xor_dist(b->id, infohash_); });
     int announced = 0;
     for (auto* n : v) {
-        if (announced >= 8) break;
+        if (announced >= 8 || !announce) break;
         send_query(n->addr, "announce_peer",
                    {{"info_hash", infohash_}, {"port", std::to_string(announce_port_)}, {"implied_port", "0"}, {"token", n->token}}, false);
         announced++;

@@ -236,3 +236,57 @@ TEST(bench_pow) {
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     printf("  BLAKE3 PoW: %.2f MH/s per thread\n", 2.0 / s);
 }
+
+#include "light/light_client.h"
+
+TEST(light_client_spv) {
+    NodeConfig cfg;
+    cfg.net = Network::Regtest;
+    cfg.datadir = temp_dir("lightnode");
+    cfg.log_stdout = false;
+    cfg.p2p.port = 27555;
+    cfg.p2p.dht = cfg.p2p.lan = cfg.p2p.upnp = false;
+    std::string ldir = temp_dir("lightwallet");
+    {
+        Node node(cfg);
+        std::string err;
+        CHECK(node.start(&err));
+        node.rpc("createwallet", json::array());
+        node.rpc("generate", json::array({"105"}));
+        auto& p = params_for(Network::Regtest);
+        auto lw = Wallet::create(ldir + "/wallet.qwl", p, mnemonic_generate(), "", "", 0, &err);
+        std::string laddr = lw->address_string(lw->issued_keys().front()->addr);
+        LightClient lc(p, ldir);
+        CHECK(lc.connect({"127.0.0.1:27555"}, 1, 2) == 1);
+        CHECK(lc.sync_headers(&err));
+        CHECK(lc.height() == 105);
+        node.rpc("send", json::array({laddr, "5.0000000001"}));
+        node.rpc("generate", json::array({"1"}));
+        CHECK(lc.sync_headers(&err));
+        CHECK(lc.refresh_wallet(*lw, &err));
+        CHECK(lw->balance(lc.height()).confirmed == 5 * COIN + 1);
+        // Spend from the phone back to the node's wallet.
+        std::string back = node.rpc("getnewaddress", json::array()).get<std::string>();
+        Transaction tx;
+        Amount fee;
+        CHECK(lw->create_tx({{back, COIN}}, 0, lc.height(), tx, &fee, &err));
+        CHECK(lc.broadcast(tx, &err));
+        if (!err.empty()) printf("  broadcast: %s\n", err.c_str());
+        lw->tx_broadcast(tx, "to pc");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(node.mempool().contains(tx.txid()));
+        node.rpc("generate", json::array({"1"}));
+        CHECK(lc.sync_headers(&err));
+        CHECK(lc.refresh_wallet(*lw, &err));
+        CHECK(lw->balance(lc.height()).confirmed == 4 * COIN + 1 - fee);
+        // A bad tx is rejected with a reason.
+        Transaction bad = tx;
+        bad.outs[0].value -= 1; // breaks the signature (and the inputs are spent anyway)
+        CHECK(!lc.broadcast(bad, &err));
+        printf("  rejected as expected: %s\n", err.c_str());
+        node.stop();
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(cfg.datadir, ec);
+    std::filesystem::remove_all(ldir, ec);
+}

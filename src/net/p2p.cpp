@@ -644,6 +644,16 @@ void P2P::lan_read() {
         socklen_t fl = sizeof from;
         int n = int(recvfrom(lan_, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl));
         if (n <= 0) return;
+        if (n == 8 && std::memcmp(buf, "QNTQ", 4) == 0 && std::memcmp(buf + 4, p_.magic, 4) == 0) {
+            // A light wallet on the LAN is asking for nodes: answer it directly.
+            Writer w;
+            w.raw((const uint8_t*)"QNTL", 4);
+            w.raw(p_.magic, 4);
+            w.u32le(opt_.port);
+            w.u64le(nonce_);
+            sendto(lan_, (const char*)w.buf.data(), int(w.buf.size()), 0, (sockaddr*)&from, sizeof from);
+            continue;
+        }
         if (n != 20 || std::memcmp(buf, "QNTL", 4) != 0 || std::memcmp(buf + 4, p_.magic, 4) != 0) continue;
         Reader r(buf + 8, 12);
         uint16_t port = uint16_t(r.u32le());

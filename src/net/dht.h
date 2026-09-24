@@ -30,6 +30,7 @@ public:
     std::function<void(const NetAddr&)> on_peer;  // a Quant node was found
     std::function<void(const NetAddr&)> on_my_ip; // a DHT node told us our public address (BEP 42)
 
+    bool announce = true; // light wallets only search, they don't announce themselves
     size_t node_count() const { return nodes_.size(); }
     size_t peers_found() const { return found_.size(); }
     int64_t last_announce_ms() const { return last_announce_; }
