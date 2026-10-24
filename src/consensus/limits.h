@@ -15,10 +15,10 @@ constexpr size_t MAX_TX_SIZE = 400'000;
 
 // ---- emission: smooth decay to a permanent tail (Monero-style, no halvings)
 //   reward = max(TAIL_SUBSIDY, (EMISSION_CURVE - issued) >> EMISSION_SPEED)
-//   Starts at ~17.5 QNT, falls smoothly, reaches the 3.5 QNT tail after ~6.5 years (~14.7M QNT) and
+//   Starts at ~8.9 QNT, falls smoothly, reaches the 3.5 QNT tail after ~29 years (~45M QNT) and
 //   stays there forever so miners (and late users) are always paid.
-constexpr Amount EMISSION_CURVE = 18'400'000ULL * COIN;
-constexpr int EMISSION_SPEED = 20;
+constexpr Amount EMISSION_CURVE = 75'000'000ULL * COIN;
+constexpr int EMISSION_SPEED = 23;
 constexpr Amount TAIL_SUBSIDY = 35 * COIN / 10;   // 3.5 QNT per block forever
 constexpr Amount MAX_MONEY = 1'000'000'000ULL * COIN; // sanity bound on any single amount / sum
 

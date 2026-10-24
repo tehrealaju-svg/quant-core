@@ -7,7 +7,7 @@ command-line client (`quant-cli`) and the shared library used by the desktop cli
 
 * **Falcon-512** (NIST post-quantum) signatures
 * **BLAKE3** hashing and proof-of-work, 2-minute blocks, difficulty adjusted every block
-* **Smooth emission**: ~17.5 QNT/block decaying to a permanent **3.5 QNT/block** tail (~6.4 years, ~14.7M issued),
+* **Smooth emission**: ~8.9 QNT/block decaying to a permanent **3.5 QNT/block** tail (~30 years, ~45.6M issued),
   no halvings, no premine, **no developer fee**, 10 decimal places
 * **Tokens + on-chain AMM** — anyone can create a token (just the normal fee); constant-product
   QNT/token pools with a 0.3% fee that goes entirely to liquidity providers

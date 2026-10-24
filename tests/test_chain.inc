@@ -156,7 +156,7 @@ TEST(sig_dedup) {
     Hash256 dest = keypair_from_seed(blake3((const uint8_t*)"d", 1)).address_hash();
     Transaction tx;
     Amount fee;
-    CHECK(w->create_tx({{encode_address(p, 0, dest), 40 * COIN, QNT_ASSET}}, 0, cs.height(), tx, &fee, &err));
+    CHECK(w->create_tx({{encode_address(p, 0, dest), 20 * COIN, QNT_ASSET}}, 0, cs.height(), tx, &fee, &err));
     CHECK(tx.ins.size() == 3);
     int refs = 0;
     for (auto& wt : tx.witness) refs += std::holds_alternative<WitnessRef>(wt);
