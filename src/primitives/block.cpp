@@ -6,13 +6,13 @@
 namespace quant {
 
 void BlockHeader::write(Writer& w) const {
-    w.u32le(version); w.hash(prev); w.hash(merkle_root); w.hash(witness_root);
+    w.u32le(version); w.hash(prev); w.hash(merkle_root); w.hash(witness_root); w.hash(state_commit);
     w.u64le(time); w.u32le(bits); w.u64le(nonce);
 }
 
 BlockHeader BlockHeader::read(Reader& r) {
     BlockHeader h;
-    h.version = r.u32le(); h.prev = r.hash(); h.merkle_root = r.hash(); h.witness_root = r.hash();
+    h.version = r.u32le(); h.prev = r.hash(); h.merkle_root = r.hash(); h.witness_root = r.hash(); h.state_commit = r.hash();
     h.time = r.u64le(); h.bits = r.u32le(); h.nonce = r.u64le();
     return h;
 }

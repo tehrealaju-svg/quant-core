@@ -204,7 +204,7 @@ bool LightClient::handshake(Peer& p, int timeout_ms) {
     v.nonce = nonce_;
     v.height = height();
     v.listen_port = 0;
-    v.agent = "quant-termux:0.1.0";
+    v.agent = "quant-termux:0.2.0";
     v.genesis = p_.genesis_hash;
     v.your_addr = p.addr;
     if (!send_msg(p, Cmd::Version, v.encode())) return false;
@@ -375,7 +375,7 @@ bool LightClient::refresh_wallet(Wallet& w, std::string* err) {
                     size_t nu = r.varint_max(100000);
                     for (size_t i = 0; i < nu; i++) {
                         OutPoint o; o.txid = r.hash(); o.n = uint32_t(r.varint());
-                        TxOut out; out.value = r.varint(); out.addr_ver = r.u8(); out.addr = r.hash();
+                        TxOut out = read_txout(r);
                         if (w.is_mine(out.addr) && !coins.count(o)) coins[o] = WalletCoin{o, out, -1, false, false};
                     }
                 } catch (const std::exception&) {

@@ -11,7 +11,7 @@ const char* cmd_name(Cmd c) {
     case Cmd::Inv: return "inv"; case Cmd::GetData: return "getdata"; case Cmd::NotFound: return "notfound";
     case Cmd::GetHeaders: return "getheaders"; case Cmd::Headers: return "headers"; case Cmd::BlockMsg: return "block";
     case Cmd::TxMsg: return "tx"; case Cmd::GetUtxos: return "getutxos"; case Cmd::Utxos: return "utxos";
-    case Cmd::Reject: return "reject";
+    case Cmd::Reject: return "reject"; case Cmd::GetSnapshot: return "getsnapshot"; case Cmd::Snapshot: return "snapshot";
     }
     return "?";
 }
@@ -34,7 +34,7 @@ VersionMsg VersionMsg::decode(Reader& r) {
 
 void UtxoProof::write(Writer& w) const {
     w.hash(op.txid); w.varint(op.n);
-    w.varint(coin.out.value); w.u8(coin.out.addr_ver); w.hash(coin.out.addr);
+    write_txout(w, coin.out);
     w.varint(coin.height); w.u8(coin.coinbase);
     w.hash(block);
     w.bytes(tx_core);
@@ -46,7 +46,7 @@ void UtxoProof::write(Writer& w) const {
 UtxoProof UtxoProof::read(Reader& r) {
     UtxoProof u;
     u.op.txid = r.hash(); u.op.n = uint32_t(r.varint());
-    u.coin.out.value = r.varint(); u.coin.out.addr_ver = r.u8(); u.coin.out.addr = r.hash();
+    u.coin.out = read_txout(r);
     u.coin.height = r.varint(); u.coin.coinbase = r.u8() != 0;
     u.block = r.hash();
     u.tx_core = r.bytes(MAX_MESSAGE);

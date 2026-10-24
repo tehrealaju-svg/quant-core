@@ -19,14 +19,15 @@ Hash256 sha256(const uint8_t* p, size_t n); // only for BIP39 mnemonic checksums
 
 // Context strings (never change these — they are consensus).
 namespace ctx {
-constexpr const char* HEADER   = "Quant v1 block header";      // unused: PoW hashes raw header
-constexpr const char* TXID     = "Quant v1 txid";
-constexpr const char* WTXID    = "Quant v1 witness";
-constexpr const char* MERKLE   = "Quant v1 merkle node";
-constexpr const char* SIGHASH  = "Quant v1 sighash";
-constexpr const char* ADDRESS  = "Quant v1 address";
-constexpr const char* PUBKEY   = "Quant v1 pubkey";
-constexpr const char* NETCHECK = "Quant v1 p2p checksum";
+constexpr const char* TXID     = "Quant v2 txid";
+constexpr const char* WTXID    = "Quant v2 witness";
+constexpr const char* MERKLE   = "Quant v2 merkle node";
+constexpr const char* SIGHASH  = "Quant v2 sighash";
+constexpr const char* ADDRESS  = "Quant v2 address";
+constexpr const char* ASSET    = "Quant v2 token id";
+constexpr const char* LPTOKEN  = "Quant v2 pool share id";
+constexpr const char* STATE    = "Quant v2 state snapshot";
+constexpr const char* NETCHECK = "Quant v2 p2p checksum";
 } // namespace ctx
 
 } // namespace quant

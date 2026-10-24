@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quant White Paper</title>
+<style>
+  @page { size: Letter; margin: 0.75in 0.9in 0.75in 0.9in; }
+  html { background: #fff; }
+  body { font-family: "Times New Roman", Times, serif; font-size: 11pt; line-height: 1.27; color: #000; margin: 0; text-align: justify; hyphens: auto; }
+  h1 { font-size: 17pt; text-align: center; margin: 0 0 10pt; font-weight: bold; }
+  .author { text-align: center; margin: 0 0 2pt; }
+  .site { text-align: center; font-size: 10.5pt; margin-bottom: 18pt; }
+  .abstract { margin: 0 0.45in 16pt; font-size: 10.5pt; }
+  .abstract b { display: block; text-align: center; margin-bottom: 4pt; }
+  h2 { font-size: 12pt; margin: 14pt 0 5pt; font-weight: bold; break-after: avoid; }
+  p { margin: 0 0 7pt; }
+  .fig { margin: 8pt auto 10pt; text-align: center; break-inside: avoid; }
+  .fig svg { max-width: 100%; }
+  .cap { font-size: 9.5pt; text-align: center; margin-top: 2pt; }
+  table { border-collapse: collapse; margin: 6pt auto 10pt; font-size: 10pt; break-inside: avoid; }
+  th, td { border: 0.6pt solid #000; padding: 2.5pt 9pt; text-align: right; }
+  th { font-weight: bold; text-align: center; }
+  td:first-child { text-align: left; }
+  .eq { text-align: center; font-style: italic; margin: 6pt 0 8pt; }
+  code { font-family: "Courier New", monospace; font-size: 10pt; }
+  ol.refs { font-size: 9.5pt; padding-left: 18pt; margin: 4pt 0 0; text-align: left; }
+  ol.refs li { margin-bottom: 2pt; }
+  .svgtxt { font-family: "Times New Roman", Times, serif; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<h1>Quant: A Post-Quantum Peer-to-Peer Electronic Cash System</h1>
+<p class="author">The Quant contributors</p>
+<p class="site">github.com/tehrealaju-svg/quant-core &nbsp;·&nbsp; October 2026 &nbsp;·&nbsp; version 2</p>
+
+<div class="abstract">
+<b>Abstract</b>
+Bitcoin showed that people can send money to each other without a bank, but every coin it
+protects is guarded by a signature that a large enough quantum computer could forge. Quant is
+a cash system built from the start on cryptography that is believed to survive quantum computers:
+Falcon-512 signatures, chosen by the U.S. National Institute of Standards and Technology for exactly
+this purpose, and BLAKE3 hashing for proof-of-work. Post-quantum signatures are larger than the
+ones they replace, so Quant is designed to stay small anyway: signatures are thrown away once
+they are buried a week deep, and every two weeks the whole state of the ledger is written down,
+fingerprinted inside a block, and handed to new users so they do not need the full history. The
+same chain carries user-created tokens and a built-in exchange, so trading needs no company in
+the middle. There is no premine, no developer fee, and fees are a fraction of a cent.
+</div>
+
+<h2>1. Introduction</h2>
+<p>
+Digital cash has two hard problems: proving who owns a coin, and agreeing on the order of
+payments so nobody can spend the same coin twice. Bitcoin solved both with digital signatures
+and a chain of proof-of-work [1]. The second idea holds up well against quantum computers. The
+first does not. Bitcoin's signatures (ECDSA and Schnorr on the secp256k1 curve) rest on a math
+problem that Shor's algorithm solves efficiently on a quantum computer [2]. Once such a machine
+exists, anyone who can see a public key can compute the private key behind it.
+</p>
+<p>
+Quant keeps Bitcoin's overall design, because it is proven and widely understood, and replaces
+the parts that age badly. Ownership is proven with lattice-based signatures. The chain is kept
+small with pruning and snapshots. Tokens and trading are part of the protocol, so the common
+things people want to do with a cryptocurrency do not depend on a trusted operator.
+</p>
+
+<h2>2. Transactions</h2>
+<p>
+A coin is a chain of signatures, as in Bitcoin. Each transaction spends earlier outputs and
+creates new ones. An output names an amount, an asset (QNT or a token), and an address. An
+address is the BLAKE3 hash of a Falcon public key, so the public key itself stays hidden until
+its owner spends. To spend, the owner reveals the key and signs the hash of the whole
+transaction, bound to this network's genesis block so it cannot be replayed on another chain.
+</p>
+<div class="fig">
+<svg width="520" height="120" viewBox="0 0 520 120" class="svgtxt">
+  <g fill="none" stroke="#000" stroke-width="1">
+    <rect x="10" y="10" width="150" height="100"/><rect x="185" y="10" width="150" height="100"/><rect x="360" y="10" width="150" height="100"/>
+    <rect x="25" y="34" width="120" height="22"/><rect x="200" y="34" width="120" height="22"/><rect x="375" y="34" width="120" height="22"/>
+    <rect x="25" y="70" width="120" height="30"/><rect x="200" y="70" width="120" height="30"/><rect x="375" y="70" width="120" height="30"/>
+    <path d="M145 45 L200 45"/><path d="M320 45 L375 45"/>
+    <path d="M195 41 L200 45 L195 49"/><path d="M370 41 L375 45 L370 49"/>
+  </g>
+  <g text-anchor="middle" fill="#000">
+    <text x="85" y="26">Transaction</text><text x="260" y="26">Transaction</text><text x="435" y="26">Transaction</text>
+    <text x="85" y="49">Owner 1's address</text><text x="260" y="49">Owner 2's address</text><text x="435" y="49">Owner 3's address</text>
+    <text x="85" y="83">Owner 0's Falcon</text><text x="85" y="95">key + signature</text>
+    <text x="260" y="83">Owner 1's Falcon</text><text x="260" y="95">key + signature</text>
+    <text x="435" y="83">Owner 2's Falcon</text><text x="435" y="95">key + signature</text>
+  </g>
+</svg>
+<div class="cap">Figure 1. Each owner passes a coin on by signing it over to the next owner's address.</div>
+</div>
+<p>
+Several coins sent to the same address need only one signature: later inputs point back to the
+first one. Every number is stored in a compact variable-length form with exactly one valid
+encoding, so a transaction's id cannot be changed by re-encoding it.
+</p>
+
+<h2>3. Quantum Security</h2>
+<p>
+Quant signs with Falcon-512, standardized by NIST as FN-DSA [3]. Its security rests on finding
+short vectors in structured lattices, a problem for which no efficient quantum algorithm is
+known. Falcon was chosen over the other NIST schemes because its signatures are the smallest:
+about 655 bytes, with an 897-byte public key, against roughly 2,400 bytes for ML-DSA. Hiding
+the key behind a hash adds a second layer: an attacker cannot even begin until the owner spends.
+</p>
+<p>
+Hash functions are only weakened, not broken, by quantum computers. Grover's algorithm [4] at
+best halves the effective strength of a hash, so 256-bit BLAKE3 [5] keeps about 128 bits of
+security for addresses and block ids. Proof-of-work is affected the same way: a quantum miner
+gets a square-root speedup on a fixed problem, which the difficulty adjustment absorbs like any
+other faster hardware.
+</p>
+
+<h2>4. Proof-of-Work and the Chain</h2>
+<p>
+Blocks form a chain as in Bitcoin: each 152-byte header contains the hash of the previous one,
+a Merkle root of its transactions, a second Merkle root of their signatures, a state
+commitment (Section 6), a time, a difficulty target and a nonce. Miners search for a nonce that
+makes the BLAKE3 hash of the header fall below the target. BLAKE3 is fast on ordinary computers,
+phones and small boards, so anyone can verify the chain cheaply. The target is recalculated
+every block from the last 60 blocks (the LWMA method [6]) to keep blocks two minutes apart, so a
+sudden drop in mining power cannot stall the chain for weeks. Nodes follow the chain with the
+most total work, and refuse to reorganize more than one week of blocks, which also protects new
+nodes from long, cheaply faked histories.
+</p>
+
+<h2>5. Tokens and the Built-In Exchange</h2>
+<p>
+Anyone can create a token, such as a meme coin, with a single transaction. It costs nothing but
+the normal fee. The creator picks a ticker, a name, a number of decimals and a supply, and the
+whole supply appears in their wallet. The token's id is derived from the coin the transaction
+spends, so ids can never collide. After that, tokens move exactly like QNT.
+</p>
+<p>
+Trading happens against on-chain pools, one per token, each holding QNT and the token. Prices
+follow the constant-product rule used by Uniswap [7]: a pool holding <i>x</i> QNT and <i>y</i>
+tokens only accepts trades that keep the product from falling.
+</p>
+<p class="eq">(x + 0.997·Δx) · (y − Δy) ≥ x · y</p>
+<p>
+A trade states exactly what it pays in and what it takes out, and the network checks the
+result against the rule above, so a trader can never receive less than they signed for. If the
+price moves first, the trade is rejected and no money is lost. The 0.3% fee stays in the pool
+and belongs entirely to the people who supplied its liquidity. Nobody else takes a cut. Every
+asset in every transaction must balance exactly, so tokens cannot be created from nothing.
+</p>
+
+<h2>6. Keeping the Chain Small</h2>
+<p>
+Post-quantum signatures are large, and they are most of a transaction. But a signature is only
+needed once: to check that a spend was authorized. Quant keeps signatures in a separate part of
+each block with its own Merkle root. Nodes check them, keep them for one week (5,040 blocks) so
+they can survive a reorganization, and then delete them. What remains of a typical payment is
+about 117 bytes, smaller than a Bitcoin payment.
+</p>
+<p>
+History is the other cost. Every 10,080 blocks (about two weeks) each node writes down the full
+state of the ledger: every unspent coin, every token and every pool. It hashes this snapshot,
+and the block 100 blocks later must carry that hash in its header. A miner who lies about the
+state produces a block every honest node rejects. A new node downloads the headers, checks the
+proof-of-work, and then fetches the newest snapshot from any peer and checks it against the
+hash in the header. From there it verifies only the blocks after the snapshot.
+</p>
+<div class="fig">
+<svg width="525" height="82" viewBox="0 0 525 82" class="svgtxt">
+  <g fill="none" stroke="#000" stroke-width="1">
+    <rect x="10" y="20" width="45" height="30"/><rect x="75" y="20" width="55" height="30"/>
+    <rect x="150" y="20" width="90" height="30" stroke-width="2"/><rect x="260" y="20" width="45" height="30"/>
+    <rect x="325" y="20" width="95" height="30" stroke-width="2"/><rect x="440" y="20" width="75" height="30"/>
+    <path d="M55 35 H75 M130 35 H150 M240 35 H260 M305 35 H325 M420 35 H440"/>
+    <path d="M195 50 C195 72, 372 72, 372 52"/><path d="M368 57 L372 51 L376 57"/>
+  </g>
+  <g text-anchor="middle" fill="#000">
+    <text x="32" y="39">…</text><text x="102" y="39">Block</text><text x="195" y="33">Block S</text><text x="195" y="45">state hashed</text>
+    <text x="282" y="39">…</text><text x="372" y="33">Block S+100</text><text x="372" y="45">commits the hash</text><text x="477" y="39">newer blocks</text>
+    <text x="282" y="76">new nodes start from the state at S, then verify only newer blocks</text>
+  </g>
+</svg>
+<div class="cap">Figure 2. A state snapshot is committed in a later header, so new nodes can skip old history.</div>
+</div>
+
+<h2>7. Supply</h2>
+<p>
+New coins are created only by mining. There is no premine, no developer fee, and the genesis
+block pays nobody. Instead of Bitcoin's sudden halvings, the reward shrinks a little every
+block: it is 1/2<sup>20</sup> of the coins left on an 18.4-million curve, starting near 17.5 QNT.
+After about 6.4 years, when 14.7 million QNT exist, the reward stops shrinking and stays at 3.5
+QNT per block forever. This tail keeps miners paid without relying only on fees. It also means
+people who arrive later can still earn new coins, and the yearly increase keeps falling as a
+share of the total. QNT has 10 decimal places.
+</p>
+<table>
+  <tr><th>Years after launch</th><th>Block reward (QNT)</th><th>Total supply (QNT)</th><th>Yearly growth</th></tr>
+  <tr><td>0</td><td>17.55</td><td>0</td><td>–</td></tr>
+  <tr><td>1</td><td>13.66</td><td>4.08 M</td><td>–</td></tr>
+  <tr><td>2</td><td>10.63</td><td>7.26 M</td><td>–</td></tr>
+  <tr><td>4</td><td>6.43</td><td>11.65 M</td><td>–</td></tr>
+  <tr><td>6.4 (tail begins)</td><td>3.5</td><td>14.73 M</td><td>6.2%</td></tr>
+  <tr><td>10</td><td>3.5</td><td>18.02 M</td><td>5.1%</td></tr>
+  <tr><td>20</td><td>3.5</td><td>27.22 M</td><td>3.4%</td></tr>
+  <tr><td>50</td><td>3.5</td><td>54.83 M</td><td>1.7%</td></tr>
+</table>
+
+<h2>8. Fees</h2>
+<p>
+The minimum fee is 0.00001 QNT per 1,000 bytes, about 0.00002 QNT for a normal payment. Fees go
+to the miner of the block, and nowhere else. Fees are charged on size, not value, so sending a
+large amount costs the same as sending a small one. The smallest QNT output is 0.000001 QNT,
+which stops the ledger from filling up with worthless dust.
+</p>
+
+<h2>9. Network</h2>
+<p>
+Nodes find each other without any central server: through the public BitTorrent DHT, broadcasts
+on the local network, and addresses saved from earlier sessions. IPv6 is supported, so nodes
+behind carrier-grade NAT, as on many mobile and satellite connections, can still be reached.
+Phone wallets do not need the whole chain. As in Bitcoin's simplified payment verification [1],
+they download only block headers and ask full nodes for their own coins, each with a Merkle
+proof that it is really in a block. Browser wallets and websites build and sign transactions
+locally and send only the signed result, so private keys never leave the user's device.
+</p>
+
+<h2>10. Security</h2>
+<p>
+As in Bitcoin, the chain is safe as long as honest miners control most of the mining power. An
+attacker's chance of catching up from <i>z</i> blocks behind falls off exponentially with
+<i>z</i> [1]. With two-minute blocks, waiting 30 confirmations gives about the same safety, in
+the same hour, as six Bitcoin confirmations. Pruning removes signatures only after a week,
+beyond the reorganization limit, and a snapshot is trusted only when buried under real
+proof-of-work. The main new risk is cryptographic. Falcon is younger than ECDSA, so the format
+carries version numbers that let the network add another signature scheme by soft fork if
+lattices are ever weakened.
+</p>
+
+<h2>11. Conclusion</h2>
+<p>
+Quant keeps what works in Bitcoin, a public chain secured by proof-of-work and coins controlled
+only by their owners' keys, and replaces what a quantum computer would break. Falcon-512
+signatures protect ownership. Pruning and committed snapshots keep the chain small enough that
+ordinary computers can run full nodes. Tokens and a constant-product exchange are part of the
+protocol, so everyday uses need no trusted company. The supply is fixed by code, fair from the
+first block, and pays miners forever without a developer tax.
+</p>
+
+<h2>References</h2>
+<ol class="refs">
+  <li>S. Nakamoto, "Bitcoin: A Peer-to-Peer Electronic Cash System," 2008.</li>
+  <li>P. W. Shor, "Polynomial-Time Algorithms for Prime Factorization and Discrete Logarithms on a Quantum Computer," <i>SIAM J. Computing</i>, 1997.</li>
+  <li>P.-A. Fouque et al., "Falcon: Fast-Fourier Lattice-based Compact Signatures over NTRU," NIST PQC submission; standardized as FN-DSA (FIPS 206).</li>
+  <li>L. K. Grover, "A fast quantum mechanical algorithm for database search," <i>STOC</i>, 1996.</li>
+  <li>J. O'Connor, J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn, "BLAKE3: one function, fast everywhere," 2020.</li>
+  <li>zawy12, "LWMA difficulty algorithm," github.com/zawy12/difficulty-algorithms, 2018.</li>
+  <li>H. Adams, N. Zinsmeister, D. Robinson, "Uniswap v2 Core," 2020.</li>
+</ol>
+
+</body>
+</html>

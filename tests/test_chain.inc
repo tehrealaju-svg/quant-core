@@ -55,14 +55,14 @@ TEST(chain_mine_spend_reorg) {
         }
         CHECK(cs.height() == COINBASE_MATURITY + 5);
         Balance bal = w->balance(cs.height());
-        CHECK(bal.confirmed == 6 * 50 * COIN);
-        CHECK(bal.immature == 99 * 50 * COIN);
+        CHECK(bal.confirmed == issued_through(6));
+        CHECK(bal.immature == issued_through(COINBASE_MATURITY + 5) - issued_through(6));
 
         // Send to a fresh key; Falcon-signed tx through the mempool into a block.
         other_addr = keypair_from_seed(blake3((const uint8_t*)"other", 5)).address_hash();
         Transaction tx;
         Amount fee = 0;
-        CHECK(w->create_tx({{encode_address(p, 0, other_addr), 7 * COIN + 12345}}, 0, cs.height(), tx, &fee, &err));
+        CHECK(w->create_tx({{encode_address(p, 0, other_addr), 7 * COIN + 12345, QNT_ASSET}}, 0, cs.height(), tx, &fee, &err));
         printf("  tx size %zu bytes (core %zu), fee %s QNT\n", tx.full_size(), tx.core_bytes().size(), format_amount(fee).c_str());
         CHECK(mp.accept(tx, &err));
         if (!err.empty()) printf("  mempool: %s\n", err.c_str());
@@ -80,7 +80,7 @@ TEST(chain_mine_spend_reorg) {
 
         // Tampered signature => block invalid.
         Transaction tx2;
-        CHECK(w->create_tx({{encode_address(p, 0, other_addr), COIN}}, 0, cs.height(), tx2, &fee, &err));
+        CHECK(w->create_tx({{encode_address(p, 0, other_addr), COIN, QNT_ASSET}}, 0, cs.height(), tx2, &fee, &err));
         auto& fw = std::get<WitnessFalcon>(tx2.witness[0]);
         fw.sig[fw.sig.size() / 2] ^= 0x55;
         CHECK(!mp.accept(tx2, &err));
@@ -104,18 +104,20 @@ TEST(chain_mine_spend_reorg) {
             Transaction cb;
             cb.lock_height = uint64_t(fh + 1 + i);
             cb.extra = {'s', uint8_t(i)};
-            cb.outs.push_back(TxOut{block_subsidy(uint64_t(fh + 1 + i)), 0, side_pay});
+            cb.outs.push_back(TxOut{block_subsidy(uint64_t(fh + 1 + i)), QNT_ASSET, side_pay});
             sb.txs.push_back(cb);
             sb.header.prev = prevh.hash();
             sb.header.time = prevh.time + 1;
             sb.header.bits = p.genesis_bits;
+            sb.header.state_commit = cs.commit_for_next(cs.lookup(sb.header.prev));
             sb.header.merkle_root = sb.compute_merkle_root();
             sb.header.witness_root = sb.compute_witness_root();
             CHECK(mine_header(sb.header, p, 1ULL << 24));
+            cs.accept_block(sb, true, &err); // one at a time: the next header may need this one's index
             side.push_back(sb);
             prevh = sb.header;
         }
-        for (auto& sb : side) cs.accept_block(sb, true, &err);
+        (void)0;
         CHECK(cs.tip()->hash == side.back().header.hash());
         CHECK(cs.coins_for_address(other_addr).size() == 4); // tx output gone, 4 side rewards
         CHECK(!cs.find_tx_block(txid_sent));
@@ -139,9 +141,8 @@ TEST(chain_mine_spend_reorg) {
     { std::error_code ec; std::filesystem::remove_all(dir, ec); }
 }
 
-TEST(sig_dedup_and_backup_key) {
-    // Several coins at one address share a single Falcon signature (WitnessRef);
-    // the SPHINCS+ backup key can also spend.
+TEST(sig_dedup) {
+    // Several coins at one address share a single Falcon signature (WitnessRef).
     auto& p = params_for(Network::Regtest);
     std::string dir = temp_dir("dedup");
     Chainstate cs(p, dir);
@@ -155,7 +156,7 @@ TEST(sig_dedup_and_backup_key) {
     Hash256 dest = keypair_from_seed(blake3((const uint8_t*)"d", 1)).address_hash();
     Transaction tx;
     Amount fee;
-    CHECK(w->create_tx({{encode_address(p, 0, dest), 120 * COIN}}, 0, cs.height(), tx, &fee, &err));
+    CHECK(w->create_tx({{encode_address(p, 0, dest), 40 * COIN, QNT_ASSET}}, 0, cs.height(), tx, &fee, &err));
     CHECK(tx.ins.size() == 3);
     int refs = 0;
     for (auto& wt : tx.witness) refs += std::holds_alternative<WitnessRef>(wt);
@@ -166,11 +167,8 @@ TEST(sig_dedup_and_backup_key) {
     for (int i = 0; i < 2; i++) CHECK(cs.accept_block(mine_on(cs, mp, payout), true, &err));
 
     Transaction btx;
-    CHECK(w->create_sweep(encode_address(p, 0, dest), 0, cs.height(), btx, &fee, &err, true));
-    CHECK(std::holds_alternative<WitnessSphincs>(btx.witness[0]));
+    CHECK(w->create_sweep(encode_address(p, 0, dest), 0, cs.height(), btx, &fee, &err));
     CHECK(mp.accept(btx, &err));
-    if (!err.empty()) printf("  backup: %s\n", err.c_str());
-    printf("  SPHINCS+ backup sweep: %zu bytes, fee %s\n", btx.full_size(), format_amount(fee).c_str());
     { std::error_code ec; std::filesystem::remove_all(dir, ec); }
 }
 
@@ -212,7 +210,7 @@ TEST(node_rpc_regtest) {
         CHECK(r.contains("seed_words"));
         node.rpc("generate", json::array({"105"}));
         CHECK(node.rpc("getblockcount", json::array()).get<int64_t>() == 105);
-        CHECK(node.rpc("getbalance", json::array()).get<std::string>() == "300.0");
+        CHECK(node.rpc("getbalance", json::array()).get<std::string>() == format_amount(issued_through(6)));
         std::string dest = node.rpc("getnewaddress", json::array({"test"})).get<std::string>();
         std::string txid = node.rpc("send", json::array({dest, "1.5"})).get<std::string>();
         CHECK(txid.size() == 64);
@@ -269,7 +267,7 @@ TEST(light_client_spv) {
         std::string back = node.rpc("getnewaddress", json::array()).get<std::string>();
         Transaction tx;
         Amount fee;
-        CHECK(lw->create_tx({{back, COIN}}, 0, lc.height(), tx, &fee, &err));
+        CHECK(lw->create_tx({{back, COIN, QNT_ASSET}}, 0, lc.height(), tx, &fee, &err));
         CHECK(lc.broadcast(tx, &err));
         if (!err.empty()) printf("  broadcast: %s\n", err.c_str());
         lw->tx_broadcast(tx, "to pc");

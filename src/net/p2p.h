@@ -26,7 +26,8 @@ struct P2POptions {
     int max_outbound = 8;
     int max_inbound = 48;
     std::string datadir;
-    std::string agent = "quant:0.1.0";
+    std::string agent = "quant:0.2.0";
+    bool fast_sync = true;           // fresh node: start from a committed state snapshot
 };
 
 struct PeerInfo {
@@ -90,6 +91,7 @@ private:
     void save_addrs();
     void publish_info();
     Bytes build_utxo_reply(const Bytes& req);
+    bool try_fast_sync(int64_t now);
     void learned_external(const NetAddr& a);
 
     Chainstate& cs_;
@@ -128,6 +130,16 @@ private:
     NetStats stats_;
     std::atomic<uint64_t> bytes_in_{0}, bytes_out_{0};
     std::atomic<size_t> peer_count_{0};
+
+    // snapshot download (fast sync) and serving
+    uint64_t snap_peer_ = 0;
+    Hash256 snap_block_;
+    Bytes snap_buf_;
+    uint64_t snap_total_ = 0;
+    int64_t snap_since_ = 0;
+    std::set<uint64_t> snap_bad_peers_;
+    Hash256 serve_snap_block_;
+    Bytes serve_snap_;
 };
 
 } // namespace quant

@@ -43,7 +43,22 @@ const std::map<std::string, Cmd>& commands() {
         {"listunspent", {"", "Wallet coins"}},
         {"listtransactions", {"[count=50]", "Wallet history"}},
         {"send", {"address amount [fee_per_kb] [subtract_fee=false]", "Send QNT"}},
-        {"sweep", {"address [use_backup_key=false]", "Send the whole balance (use_backup_key signs with SPHINCS+)"}},
+        {"sweep", {"address", "Send the whole QNT balance"}},
+        {"sendtoken", {"token address amount", "Send a token (token = id or ticker)"}},
+        {"gettokenbalances", {"", "Wallet token and pool-share balances"}},
+        {"createtoken", {"TICKER \"Name\" supply [decimals=8] [uri]", "Create a token (free apart from the normal tx fee); the whole supply goes to your wallet"}},
+        {"listtokens", {"[offset=0] [count=100] [sort=new|liquidity]", "Tokens with their pool price and liquidity"}},
+        {"gettoken", {"token", "Token details and pool"}},
+        {"getpool", {"token", "QNT/token pool reserves (pending trades included)"}},
+        {"quote", {"token buy|sell amount", "Price a trade: buy = spend QNT amount, sell = sell token amount"}},
+        {"swap", {"token buy|sell amount [max_slippage_percent=1]", "Trade on the pool"}},
+        {"addliquidity", {"token qnt_amount token_amount", "Deposit into the pool (creates it on first deposit); earns the 0.3% trade fee"}},
+        {"removeliquidity", {"token shares|all", "Withdraw your pool shares"}},
+        {"getaddresscoins", {"address", "Unspent coins (all assets, unconfirmed included) of any address, for external wallets"}},
+        {"sendrawtransaction", {"hex", "Broadcast a signed transaction (full encoding, hex)"}},
+        {"decoderawtransaction", {"hex", "Decode a transaction"}},
+        {"getsnapshotinfo", {"", "State snapshots held and committed (fast sync)"}},
+        {"getemission", {"[height]", "Block reward, issued supply and the emission schedule"}},
         {"estimatefee", {"[inputs=1] [outputs=2]", "Fee for a typical transaction at the minimum rate"}},
         {"validateaddress", {"address", "Check an address"}},
         {"createwallet", {"[\"24 words\"] [passphrase] [password]", "Create (or restore from seed words) the wallet"}},
@@ -80,6 +95,32 @@ Amount arg_amount(const json& p, size_t i) {
     return *a;
 }
 
+// Amount in base units shown with `dec` decimals (QNT has 10).
+std::string format_units(Amount a, int dec) {
+    if (dec == 10) return format_amount(a);
+    std::string s = std::to_string(a);
+    if (dec == 0) return s;
+    if (int(s.size()) <= dec) s.insert(0, size_t(dec - int(s.size()) + 1), '0');
+    s.insert(s.size() - size_t(dec), ".");
+    while (s.back() == '0') s.pop_back();
+    if (s.back() == '.') s.pop_back();
+    return s;
+}
+std::optional<Amount> parse_units(const std::string& s, int dec) {
+    if (s.empty()) return std::nullopt;
+    unsigned __int128 v = 0;
+    int frac = -1;
+    for (char c : s) {
+        if (c == '.') { if (frac >= 0) return std::nullopt; frac = 0; continue; }
+        if (c < '0' || c > '9') return std::nullopt;
+        if (frac >= 0 && ++frac > dec) return std::nullopt;
+        v = v * 10 + unsigned(c - '0');
+        if (v > ~uint64_t(0)) return std::nullopt;
+    }
+    for (int i = frac < 0 ? 0 : frac; i < dec; i++) { v *= 10; if (v > ~uint64_t(0)) return std::nullopt; }
+    return Amount(v);
+}
+
 } // namespace
 
 std::vector<std::string> Node::rpc_commands() const {
@@ -95,29 +136,102 @@ json Node::tx_json(const Transaction& tx, const Hash256* block, int64_t height) 
     j["size_core"] = tx.core_bytes().size();
     j["size_witness"] = tx.witness_bytes().size();
     if (block) { j["block"] = block->hex(); j["height"] = height; j["confirmations"] = cs_->height() - height + 1; }
+    const StateReader& st = mp_->view();
     json ins = json::array();
-    Amount in_total = 0;
     for (size_t i = 0; i < tx.ins.size(); i++) {
         json in;
         in["txid"] = tx.ins[i].prev.txid.hex();
         in["vout"] = tx.ins[i].prev.n;
-        if (i < tx.witness.size()) {
-            const Witness& w = tx.witness[i];
-            in["signature"] = std::holds_alternative<WitnessFalcon>(w) ? "falcon-512"
-                              : std::holds_alternative<WitnessSphincs>(w) ? "sphincs+ (backup key)" : "shared";
-        }
+        if (i < tx.witness.size()) in["signature"] = std::holds_alternative<WitnessFalcon>(tx.witness[i]) ? "falcon-512" : "shared";
         ins.push_back(in);
     }
     j["inputs"] = ins;
     json outs = json::array();
-    for (uint32_t n = 0; n < tx.outs.size(); n++) {
-        outs.push_back({{"n", n}, {"address", encode_address(p_, tx.outs[n].addr_ver, tx.outs[n].addr)},
-                        {"amount", format_amount(tx.outs[n].value)}});
-    }
+    for (uint32_t n = 0; n < tx.outs.size(); n++) outs.push_back(out_json(tx.outs[n], st, n));
     j["outputs"] = outs;
-    j["total_out"] = format_amount(tx.total_out());
+    json ops = json::array();
+    for (auto& op : tx.ops) ops.push_back(op_json(op, st));
+    if (!ops.empty()) j["ops"] = ops;
+    j["total_qnt_out"] = format_amount(tx.total_qnt_out());
     if (tx.is_coinbase()) j["miner_tag"] = std::string(tx.extra.begin(), tx.extra.end() - std::min<size_t>(8, tx.extra.size()));
-    (void)in_total;
+    return j;
+}
+
+json Node::out_json(const TxOut& o, const StateReader& st, int64_t n) {
+    json j;
+    if (n >= 0) j["n"] = n;
+    j["address"] = encode_address(p_, 0, o.addr);
+    j["asset"] = asset_label(o.asset, st);
+    if (!o.is_qnt()) j["asset_id"] = o.asset.hex();
+    j["amount"] = format_units(o.value, asset_decimals(o.asset, st));
+    j["units"] = o.value;
+    return j;
+}
+
+json Node::op_json(const TxOp& op, const StateReader& st) {
+    return std::visit([&](auto& o) -> json {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, OpCreateToken>) {
+            return {{"type", "create-token"}, {"ticker", o.ticker}, {"name", o.name}, {"decimals", o.decimals},
+                    {"supply", format_units(o.supply, o.decimals)}, {"uri", o.uri}};
+        } else {
+            int d = asset_decimals(o.token, st);
+            std::string tk = asset_label(o.token, st);
+            if constexpr (std::is_same_v<T, OpPoolCreate>)
+                return {{"type", "pool-create"}, {"token", tk}, {"qnt", format_amount(o.qnt)}, {"tok", format_units(o.tok, d)}, {"shares", o.shares}};
+            else if constexpr (std::is_same_v<T, OpAddLiquidity>)
+                return {{"type", "add-liquidity"}, {"token", tk}, {"qnt", format_amount(o.qnt)}, {"tok", format_units(o.tok, d)}, {"shares", o.shares}};
+            else if constexpr (std::is_same_v<T, OpRemoveLiquidity>)
+                return {{"type", "remove-liquidity"}, {"token", tk}, {"shares", o.shares}, {"qnt", format_amount(o.qnt)}, {"tok", format_units(o.tok, d)}};
+            else
+                return {{"type", o.sell ? "sell" : "buy"}, {"token", tk},
+                        {"in", o.sell ? format_units(o.in, d) : format_amount(o.in)},
+                        {"out", o.sell ? format_amount(o.out) : format_units(o.out, d)}};
+        }
+    }, op);
+}
+
+int Node::asset_decimals(const Hash256& a, const StateReader& st) {
+    if (a.is_zero()) return 10;
+    if (auto t = st.token(a)) return t->decimals;
+    return 0; // pool shares and unknown assets are whole units
+}
+
+std::string Node::asset_label(const Hash256& a, const StateReader& st) {
+    if (a.is_zero()) return "QNT";
+    if (auto t = st.token(a)) return t->ticker;
+    for (auto& p : cs_->all_pools())
+        if (pool_share_id(p.token) == a) { auto t = st.token(p.token); return (t ? t->ticker : p.token.hex().substr(0, 8)) + "-QNT-SHARE"; }
+    return a.hex().substr(0, 16);
+}
+
+json Node::pool_json(const Pool& p, const StateReader& st) {
+    auto t = st.token(p.token);
+    int d = t ? t->decimals : 0;
+    json j;
+    j["token"] = p.token.hex();
+    j["ticker"] = t ? t->ticker : "";
+    j["qnt_reserve"] = format_amount(p.qnt);
+    j["token_reserve"] = format_units(p.tok, d);
+    j["shares"] = p.shares;
+    j["share_id"] = pool_share_id(p.token).hex();
+    // Price of one whole token in QNT: (qnt / 10^10) / (tok / 10^d)
+    j["price_qnt"] = p.tok ? (double(p.qnt) / 1e10) / (double(p.tok) / std::pow(10.0, d)) : 0.0;
+    j["liquidity_qnt"] = 2.0 * double(p.qnt) / 1e10; // both sides valued in QNT
+    return j;
+}
+
+json Node::token_json(const TokenInfo& t, const StateReader& st) {
+    json j;
+    j["id"] = t.id.hex();
+    j["ticker"] = t.ticker;
+    j["name"] = t.name;
+    j["decimals"] = t.decimals;
+    j["supply"] = format_units(t.supply, t.decimals);
+    j["uri"] = t.uri;
+    j["created_txid"] = t.create_txid.hex();
+    j["created_height"] = t.height;
+    if (auto p = st.pool(t.id)) j["pool"] = pool_json(*p, st);
     return j;
 }
 
@@ -137,7 +251,8 @@ json Node::block_json(const Block& b, const BlockIndex* idx, bool verbose) {
     j["size_core"] = b.core_bytes().size();
     j["signatures_pruned"] = !cs_->have_witness(idx);
     j["difficulty"] = params().pow_limit.to_double() / U256::from_compact(b.header.bits).to_double();
-    j["reward"] = format_amount(b.txs.empty() ? 0 : b.txs[0].total_out());
+    j["reward"] = format_amount(b.txs.empty() ? 0 : b.txs[0].total_qnt_out());
+    j["state_commit"] = b.header.state_commit.is_zero() ? "" : b.header.state_commit.hex();
     if (verbose) {
         json txs = json::array();
         for (auto& t : b.txs) txs.push_back(tx_json(t, &idx->hash, idx->height));
@@ -191,7 +306,7 @@ json Node::rpc(const std::string& method, const json& params) {
         j["pruning"] = cfg_.prune;
         j["mempool_txs"] = mp_->size();
         if (method == "getinfo") {
-            j["version"] = "0.1.0";
+            j["version"] = "0.2.0";
             if (p2p_) { j["peers"] = p2p_->peer_count(); }
             j["mining"] = miner_->running();
             j["hashrate"] = miner_->hashrate();
@@ -238,11 +353,19 @@ json Node::rpc(const std::string& method, const json& params) {
         if (method == "getaddressinfo") {
             Amount bal = 0;
             json coins = json::array();
+            const StateReader& sv = mp_->view();
+            json tokens = json::array();
+            for (auto& [asset, v] : cs_->balances_for_address(a)) {
+                if (asset.is_zero()) { bal = v; continue; }
+                tokens.push_back({{"asset", asset_label(asset, sv)}, {"asset_id", asset.hex()}, {"amount", format_units(v, asset_decimals(asset, sv))}});
+            }
             for (auto& [op, c] : cs_->coins_for_address(a)) {
-                bal += c.out.value;
-                coins.push_back({{"txid", op.txid.hex()}, {"vout", op.n}, {"amount", format_amount(c.out.value)}, {"height", c.height}});
+                json cj = out_json(c.out, sv);
+                cj["txid"] = op.txid.hex(); cj["vout"] = op.n; cj["height"] = c.height;
+                coins.push_back(cj);
             }
             j["balance"] = format_amount(bal);
+            j["tokens"] = tokens;
             j["coins"] = coins;
         }
         return j;
@@ -324,8 +447,7 @@ json Node::rpc(const std::string& method, const json& params) {
         json a = json::array();
         Wallet& w = need_wallet();
         for (auto* k : w.issued_keys()) {
-            Amount bal = 0;
-            for (auto& [op, c] : cs_->coins_for_address(k->addr)) bal += c.out.value;
+            Amount bal = cs_->balances_for_address(k->addr)[QNT_ASSET];
             a.push_back({{"address", w.address_string(k->addr)}, {"label", k->label}, {"index", k->index}, {"balance", format_amount(bal)}});
         }
         return a;
@@ -355,14 +477,14 @@ json Node::rpc(const std::string& method, const json& params) {
     if (method == "send") {
         need_wallet();
         Amount fee_kb = has_arg(p, 2) ? arg_amount(p, 2) : 0;
-        return send({{arg_str(p, 0), arg_amount(p, 1)}}, fee_kb, arg_bool(p, 3, false), "");
+        return send({{arg_str(p, 0), arg_amount(p, 1), QNT_ASSET}}, fee_kb, arg_bool(p, 3, false), "");
     }
     if (method == "sweep") {
         Wallet& w = need_wallet();
         Transaction tx;
         Amount fee;
         std::string err;
-        if (!w.create_sweep(arg_str(p, 0), 0, cs_->height(), tx, &fee, &err, arg_bool(p, 1, false))) throw RpcError(err);
+        if (!w.create_sweep(arg_str(p, 0), 0, cs_->height(), tx, &fee, &err)) throw RpcError(err);
         if (!mp_->accept(tx, &err)) throw RpcError("rejected: " + err);
         w.tx_broadcast(tx, "sweep");
         if (p2p_) p2p_->broadcast_tx(tx);
@@ -401,7 +523,200 @@ json Node::rpc(const std::string& method, const json& params) {
         for (auto& c : need_wallet().contacts) a.push_back({{"name", c.name}, {"address", c.address}});
         return a;
     }
+    // ---- tokens / pools (reads use the mempool view: pending trades included)
+    const StateReader& st = mp_->view();
+    auto broadcast_built = [&](const Transaction& tx, const std::string& note, Amount fee, json extra) {
+        std::string id = broadcast(tx, note);
+        extra["txid"] = id;
+        extra["fee"] = format_amount(fee);
+        return extra;
+    };
+    auto tip = [&] { return cs_->height(); };
+    auto fee_kb = Amount(0);
+    if (method == "listtokens") {
+        int64_t off = arg_int(p, 0, 0), cnt = std::clamp<int64_t>(arg_int(p, 1, 100), 1, 1000);
+        std::string sort = arg_str(p, 2, "new");
+        auto toks = cs_->all_tokens();
+        if (sort == "liquidity") {
+            std::sort(toks.begin(), toks.end(), [&](auto& a, auto& b) {
+                auto pa = st.pool(a.id), pb = st.pool(b.id);
+                return (pa ? pa->qnt : 0) > (pb ? pb->qnt : 0);
+            });
+        } else {
+            std::sort(toks.begin(), toks.end(), [](auto& a, auto& b) { return a.height > b.height; });
+        }
+        json a = json::array();
+        for (int64_t i = off; i < int64_t(toks.size()) && i < off + cnt; i++) a.push_back(token_json(toks[size_t(i)], st));
+        return json{{"total", toks.size()}, {"tokens", a}};
+    }
+    if (method == "gettoken") {
+        auto t = st.token(resolve_token(arg_str(p, 0)));
+        return token_json(*t, st);
+    }
+    if (method == "getpool") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        auto pl = st.pool(id);
+        if (!pl) throw RpcError("no pool for this token yet (create it with addliquidity)");
+        return pool_json(*pl, st);
+    }
+    if (method == "quote" || method == "swap") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        std::string side = arg_str(p, 1);
+        if (side != "buy" && side != "sell") throw RpcError("side must be buy or sell");
+        bool sell = side == "sell";
+        auto pl = st.pool(id);
+        if (!pl) throw RpcError("no pool for this token yet");
+        int d = asset_decimals(id, st);
+        auto in = parse_units(arg_str(p, 2), sell ? d : 10);
+        if (!in || !*in) throw RpcError("invalid amount");
+        Amount rin = sell ? pl->tok : pl->qnt, rout = sell ? pl->qnt : pl->tok;
+        Amount out = amm_quote(*in, rin, rout);
+        if (!out) throw RpcError("amount too small");
+        double spot = double(rout) / double(rin), exec = double(out) / double(*in);
+        double impact = spot > 0 ? (1.0 - exec / spot) * 100.0 : 0;
+        json q{{"side", side}, {"in", sell ? format_units(*in, d) : format_amount(*in)},
+               {"out", sell ? format_amount(out) : format_units(out, d)}, {"price_impact_percent", impact},
+               {"pool_fee_percent", double(POOL_FEE_BPS) / 100.0}};
+        if (method == "quote") return q;
+        double slip = has_arg(p, 3) ? std::stod(arg_str(p, 3)) : 1.0;
+        if (slip < 0 || slip > 50) throw RpcError("max_slippage_percent must be 0-50");
+        Amount min_out = Amount(double(out) * (1.0 - slip / 100.0));
+        if (!min_out) min_out = 1;
+        Transaction tx; Amount fee; std::string err;
+        if (!need_wallet().swap(id, sell, *in, min_out, fee_kb, tip(), tx, &fee, &err)) throw RpcError(err);
+        q["min_out"] = sell ? format_amount(min_out) : format_units(min_out, d);
+        return broadcast_built(tx, side + " " + asset_label(id, st), fee, q);
+    }
+    if (method == "createtoken") {
+        OpCreateToken t;
+        t.ticker = arg_str(p, 0);
+        std::transform(t.ticker.begin(), t.ticker.end(), t.ticker.begin(), ::toupper);
+        t.name = arg_str(p, 1);
+        t.decimals = uint8_t(std::clamp<int64_t>(arg_int(p, 3, 8), 0, 255));
+        auto s = parse_units(arg_str(p, 2), t.decimals);
+        if (!s || !*s) throw RpcError("invalid supply");
+        t.supply = *s;
+        t.uri = arg_str(p, 4);
+        Transaction tx; Amount fee; Hash256 id; std::string err;
+        if (!need_wallet().create_token(t, fee_kb, tip(), tx, &id, &fee, &err)) throw RpcError(err);
+        return broadcast_built(tx, "create " + t.ticker, fee, json{{"token", id.hex()}, {"ticker", t.ticker}});
+    }
+    if (method == "addliquidity") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        int d = asset_decimals(id, st);
+        auto q = parse_units(arg_str(p, 1), 10), t = parse_units(arg_str(p, 2), d);
+        if (!q || !t) throw RpcError("invalid amount");
+        auto pl = st.pool(id);
+        Transaction tx; Amount fee, shares; std::string err;
+        if (!need_wallet().add_liquidity(id, *q, *t, pl, fee_kb, tip(), tx, &shares, &fee, &err)) throw RpcError(err);
+        return broadcast_built(tx, "add liquidity " + asset_label(id, st), fee, json{{"shares", shares}, {"new_pool", !pl}});
+    }
+    if (method == "removeliquidity") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        auto pl = st.pool(id);
+        if (!pl) throw RpcError("no pool for this token");
+        Amount shares;
+        if (arg_str(p, 1) == "all") {
+            auto b = need_wallet().token_balances();
+            shares = b[pool_share_id(id)];
+        } else {
+            shares = Amount(arg_int(p, 1, 0));
+        }
+        Transaction tx; Amount fee, q, t; std::string err;
+        if (!need_wallet().remove_liquidity(id, shares, *pl, fee_kb, tip(), tx, &q, &t, &fee, &err)) throw RpcError(err);
+        int d = asset_decimals(id, st);
+        return broadcast_built(tx, "remove liquidity " + asset_label(id, st), fee,
+                               json{{"qnt", format_amount(q)}, {"tok", format_units(t, d)}, {"shares", shares}});
+    }
+    if (method == "sendtoken") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        auto amt = parse_units(arg_str(p, 2), asset_decimals(id, st));
+        if (!amt || !*amt) throw RpcError("invalid amount");
+        need_wallet();
+        return send({{arg_str(p, 1), *amt, id}}, 0, false, "");
+    }
+    if (method == "gettokenbalances") {
+        json a = json::array();
+        for (auto& [asset, v] : need_wallet().token_balances())
+            a.push_back({{"asset", asset_label(asset, st)}, {"asset_id", asset.hex()}, {"amount", format_units(v, asset_decimals(asset, st))}, {"units", v}});
+        return a;
+    }
+    if (method == "getaddresscoins") {
+        uint8_t v; Hash256 a;
+        if (!decode_address(p_, arg_str(p, 0), v, a)) throw RpcError("invalid address");
+        json coins = json::array();
+        for (auto& [op, c] : cs_->coins_for_address(a)) {
+            if (mp_->spends(op)) continue;
+            json j = out_json(c.out, st);
+            j["txid"] = op.txid.hex(); j["vout"] = op.n; j["height"] = c.height; j["coinbase"] = c.coinbase;
+            j["mature"] = !c.coinbase || cs_->height() + 1 >= int64_t(c.height) + COINBASE_MATURITY;
+            coins.push_back(j);
+        }
+        for (auto* e : mp_->all())
+            for (uint32_t i = 0; i < e->tx.outs.size(); i++)
+                if (e->tx.outs[i].addr == a && !mp_->spends(OutPoint{e->txid, i})) {
+                    json j = out_json(e->tx.outs[i], st);
+                    j["txid"] = e->txid.hex(); j["vout"] = i; j["height"] = -1; j["coinbase"] = false; j["mature"] = true;
+                    coins.push_back(j);
+                }
+        return json{{"address", arg_str(p, 0)}, {"coins", coins}, {"tip", cs_->height()}, {"genesis", p_.genesis_hash.hex()},
+                    {"min_fee_per_kb", MIN_RELAY_FEE_PER_KB}};
+    }
+    if (method == "sendrawtransaction" || method == "decoderawtransaction") {
+        auto raw = hex_decode(arg_str(p, 0));
+        if (!raw) throw RpcError("bad hex");
+        Transaction tx;
+        try { Reader r(*raw); tx = Transaction::read_full(r); if (!r.empty()) throw SerializeError("trailing data"); }
+        catch (const std::exception& e) { throw RpcError(std::string("cannot decode: ") + e.what()); }
+        if (method == "decoderawtransaction") return tx_json(tx, nullptr, 0);
+        std::string err;
+        if (!mp_->accept(tx, &err)) throw RpcError("transaction rejected: " + err);
+        if (p2p_) p2p_->broadcast_tx(tx);
+        return tx.txid().hex();
+    }
+    if (method == "getsnapshotinfo") {
+        json j;
+        auto best = cs_->best_snapshot_file();
+        j["serving"] = best ? best->first.hex() : "";
+        j["interval_blocks"] = p_.snapshot_interval;
+        j["commit_delay_blocks"] = p_.snapshot_delay;
+        int64_t next = (cs_->height() / p_.snapshot_interval + 1) * p_.snapshot_interval;
+        j["next_snapshot_height"] = next;
+        ChainStats s = cs_->stats();
+        j["disk_snapshots_mb"] = double(s.disk_snapshots) / 1e6;
+        return j;
+    }
+    if (method == "getemission") {
+        int64_t h = arg_int(p, 0, cs_->height() + 1);
+        if (h < 0) throw RpcError("bad height");
+        return json{{"height", h}, {"reward", format_amount(block_subsidy(uint64_t(h)))},
+                    {"issued_through_height", format_amount(issued_through(uint64_t(h)))},
+                    {"tail_reward", format_amount(TAIL_SUBSIDY)}, {"curve", format_amount(EMISSION_CURVE)},
+                    {"block_time_seconds", TARGET_SPACING}, {"premine", "0"}, {"developer_fee", "0"}};
+    }
     throw RpcError("unknown command '" + method + "' (try: help)");
 }
 
+} // namespace quant
+
+namespace quant {
+// A token is named by its 64-hex id or its ticker (tickers aren't unique: the oldest wins,
+// and the answer says so when several share it).
+Hash256 Node::resolve_token(const std::string& s) {
+    const StateReader& st = mp_->view();
+    if (s.size() == 64) {
+        auto h = Hash256::from_hex(s);
+        if (h && st.token(*h)) return *h;
+        throw RpcError("unknown token id");
+    }
+    std::string up = s;
+    std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+    std::optional<TokenInfo> best;
+    int n = 0;
+    for (auto& t : cs_->all_tokens())
+        if (t.ticker == up) { n++; if (!best || t.height < best->height) best = t; }
+    if (!best) throw RpcError("unknown token '" + s + "' (use its id or ticker)");
+    if (n > 1) logf("ticker %s is used by %d tokens; using the oldest (%s)", up.c_str(), n, best->id.hex().c_str());
+    return best->id;
+}
 } // namespace quant

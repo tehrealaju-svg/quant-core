@@ -54,15 +54,35 @@ static bool write_file_atomic(const std::string& path, const Bytes& data) {
 }
 
 static void write_coin(Writer& w, const Coin& c) {
-    w.varint(c.out.value); w.u8(c.out.addr_ver); w.hash(c.out.addr);
+    w.varint(c.out.value);
+    if (c.out.is_qnt()) w.u8(0); else { w.u8(1); w.hash(c.out.asset); }
+    w.hash(c.out.addr);
     w.varint(c.height); w.u8(c.coinbase ? 1 : 0);
 }
 static Coin read_coin(Reader& r) {
     Coin c;
-    c.out.value = r.varint(); c.out.addr_ver = r.u8(); c.out.addr = r.hash();
+    c.out.value = r.varint();
+    if (r.u8()) c.out.asset = r.hash();
+    c.out.addr = r.hash();
     c.height = r.varint(); c.coinbase = r.u8() != 0;
     return c;
 }
+static void write_token(Writer& w, const TokenInfo& t) {
+    w.hash(t.id); w.str(t.ticker); w.str(t.name); w.str(t.uri); w.u8(t.decimals);
+    w.varint(t.supply); w.hash(t.create_txid); w.varint(t.height);
+}
+static TokenInfo read_token(Reader& r) {
+    TokenInfo t;
+    t.id = r.hash(); t.ticker = r.str(MAX_TICKER); t.name = r.str(MAX_TOKEN_NAME); t.uri = r.str(MAX_TOKEN_URI);
+    t.decimals = r.u8(); t.supply = r.varint(); t.create_txid = r.hash(); t.height = r.varint();
+    return t;
+}
+static void write_pool(Writer& w, const Pool& p) { w.hash(p.token); w.varint(p.qnt); w.varint(p.tok); w.varint(p.shares); }
+static Pool read_pool(Reader& r) {
+    Pool p; p.token = r.hash(); p.qnt = r.varint(); p.tok = r.varint(); p.shares = r.varint();
+    return p;
+}
+constexpr uint32_t STATE_MAGIC = 0x32545351; // "QST2"
 
 // ---------------------------------------------------------------- skip list (O(log n) ancestors)
 static int64_t invert_lowest_one(int64_t n) { return n & (n - 1); }
@@ -173,72 +193,216 @@ bool Chainstate::load(std::string* err) {
     BlockIndex* g = lookup(p_.genesis_hash);
     if (!g->have_data) store_block(g, p_.genesis, true);
 
+    // A node bootstrapped from a snapshot has no block data at or below the snapshot block.
+    Bytes base;
+    if (read_file(dir_ + "/base.dat", base) && base.size() == 32) {
+        Hash256 bh; std::memcpy(bh.data(), base.data(), 32);
+        if (BlockIndex* b = lookup(bh)) { b->from_snapshot = true; snapshot_base_ = b->height; }
+    }
+
     // chain_data flags in height order
     std::vector<BlockIndex*> all;
     for (auto& [h, b] : index_) all.push_back(b);
     std::sort(all.begin(), all.end(), [](auto* a, auto* b) { return a->height < b->height; });
     for (auto* b : all) {
-        b->chain_data = b->have_data && (!b->prev || b->prev->chain_data);
+        b->chain_data = b->from_snapshot || (b->have_data && (!b->prev || b->prev->chain_data));
         if (b->chain_data) candidates_.insert(b);
     }
 
-    if (!load_snapshot(err)) return false;
+    scan_snapshots();
+    if (!load_tip_state(err)) return false;
 
     // tx index for the explorer: scan the active chain's core data.
     for (auto* b : chain_) {
         Block blk;
-        if (read_block(b, blk, false)) index_block_txs(blk, b, true);
+        if (b->have_data && read_block(b, blk, false)) index_block_txs(blk, b, true);
     }
-    logf("loaded %zu headers, chain height %lld, best header %lld, %zu utxos",
-         index_.size(), (long long)height(), (long long)best_header_->height, utxo_.size());
+    logf("loaded %zu headers, chain height %lld, best header %lld, %zu coins, %zu tokens, %zu pools",
+         index_.size(), (long long)height(), (long long)best_header_->height, utxo_.size(), tokens_.size(), pools_.size());
     activate_best_chain();
     return true;
 }
 
-bool Chainstate::load_snapshot(std::string* err) {
-    Bytes sb;
-    BlockIndex* g = lookup(p_.genesis_hash);
-    chain_.clear();
-    if (!read_file(dir_ + "/utxo.dat", sb) || sb.size() < 4 + 32 + 32) {
-        chain_.push_back(g);
-        return true;
-    }
+void Chainstate::clear_state() {
+    utxo_.clear(); by_addr_.clear(); tokens_.clear(); pools_.clear(); supply_ = 0;
+}
+
+Bytes Chainstate::serialize_state() const {
+    Writer w;
+    w.u32le(STATE_MAGIC);
+    w.hash(tip()->hash);
+    w.varint(uint64_t(height()));
+    std::vector<std::pair<OutPoint, const Coin*>> coins;
+    coins.reserve(utxo_.size());
+    for (auto& [o, c] : utxo_) coins.push_back({o, &c});
+    std::sort(coins.begin(), coins.end(), [](auto& a, auto& b) { return a.first < b.first; });
+    w.varint(coins.size());
+    for (auto& [o, c] : coins) { w.hash(o.txid); w.varint(o.n); write_coin(w, *c); }
+    auto toks = all_tokens();
+    w.varint(toks.size());
+    for (auto& t : toks) write_token(w, t);
+    auto pls = all_pools();
+    w.varint(pls.size());
+    for (auto& p : pls) write_pool(w, p);
+    return std::move(w.buf);
+}
+
+Hash256 Chainstate::state_hash(const Bytes& snap) { return blake3_tagged(ctx::STATE, snap); }
+
+bool Chainstate::parse_state(const Bytes& b, Hash256& block, int64_t& h) {
+    clear_state();
     try {
-        Hash256 check = blake3(sb.data(), sb.size() - 32);
-        if (std::memcmp(check.data(), sb.data() + sb.size() - 32, 32) != 0) throw SerializeError("checksum");
-        Reader r(sb.data(), sb.size() - 32);
-        if (r.u32le() != 0x58545551) throw SerializeError("magic"); // "QUTX"
-        Hash256 tiph = r.hash();
+        Reader r(b);
+        if (r.u32le() != STATE_MAGIC) throw SerializeError("magic");
+        block = r.hash();
+        h = int64_t(r.varint());
         uint64_t n = r.varint();
-        BlockIndex* t = lookup(tiph);
-        if (!t || !t->chain_data) throw SerializeError("snapshot tip unknown");
         for (uint64_t i = 0; i < n; i++) {
-            OutPoint o;
-            o.txid = r.hash();
-            o.n = uint32_t(r.varint());
+            OutPoint o; o.txid = r.hash(); o.n = uint32_t(r.varint());
             add_coin(o, read_coin(r));
         }
-        chain_.resize(t->height + 1);
-        for (BlockIndex* w = t; w; w = w->prev) chain_[w->height] = w;
+        n = r.varint();
+        for (uint64_t i = 0; i < n; i++) { auto t = read_token(r); tokens_[t.id] = t; }
+        n = r.varint();
+        for (uint64_t i = 0; i < n; i++) { auto p = read_pool(r); pools_[p.token] = p; supply_ += p.qnt; }
+        if (!r.empty()) throw SerializeError("trailing data");
     } catch (const std::exception& e) {
-        logf("utxo.dat unusable (%s) - rebuilding from blocks", e.what());
-        utxo_.clear(); by_addr_.clear(); supply_ = 0;
-        chain_.assign(1, g);
+        logf("state parse failed: %s", e.what());
+        clear_state();
+        return false;
     }
+    return true;
+}
+
+bool Chainstate::load_tip_state(std::string* err) {
+    Bytes sb;
+    BlockIndex* g = lookup(p_.genesis_hash);
+    chain_.assign(1, g);
+    if (!read_file(dir_ + "/utxo.dat", sb) || sb.size() < 40) {
+        if (snapshot_base_) { if (err) *err = "utxo.dat missing on a snapshot-bootstrapped node; delete the data directory to resync"; return false; }
+        return true;
+    }
+    Hash256 check = blake3(sb.data(), sb.size() - 32);
+    Hash256 tiph; int64_t th = 0;
+    bool ok = std::memcmp(check.data(), sb.data() + sb.size() - 32, 32) == 0;
+    if (ok) { sb.resize(sb.size() - 32); ok = parse_state(sb, tiph, th); }
+    BlockIndex* t = ok ? lookup(tiph) : nullptr;
+    if (!t || !t->chain_data || t->height != th) {
+        clear_state();
+        if (snapshot_base_) { if (err) *err = "utxo.dat unusable on a snapshot-bootstrapped node; delete the data directory to resync"; return false; }
+        logf("utxo.dat unusable - rebuilding from blocks");
+        return true;
+    }
+    chain_.resize(t->height + 1);
+    for (BlockIndex* w = t; w; w = w->prev) chain_[w->height] = w;
     return true;
 }
 
 void Chainstate::flush() {
     std::lock_guard lock(mu);
-    Writer w;
-    w.u32le(0x58545551);
-    w.hash(tip()->hash);
-    w.varint(utxo_.size());
-    for (auto& [o, c] : utxo_) { w.hash(o.txid); w.varint(o.n); write_coin(w, c); }
-    Hash256 check = blake3(w.buf);
-    w.hash(check);
-    if (!write_file_atomic(dir_ + "/utxo.dat", w.buf)) logf("WARNING: failed to write utxo.dat");
+    Bytes s = serialize_state();
+    Hash256 check = blake3(s);
+    s.insert(s.end(), check.b.begin(), check.b.end());
+    if (!write_file_atomic(dir_ + "/utxo.dat", s)) logf("WARNING: failed to write utxo.dat");
     blocks_since_flush_ = 0;
+}
+
+// ---------------------------------------------------------------- snapshots
+std::string Chainstate::snapshot_path(const Hash256& h) const { return dir_ + "/snapshots/" + h.hex() + ".snap"; }
+
+void Chainstate::scan_snapshots() {
+    std::error_code ec;
+    fs::create_directories(dir_ + "/snapshots", ec);
+    for (auto& e : fs::directory_iterator(dir_ + "/snapshots", ec)) {
+        auto name = e.path().filename().string();
+        if (name.size() != 64 + 5 || e.path().extension() != ".snap") continue;
+        auto bh = Hash256::from_hex(name.substr(0, 64));
+        Bytes b;
+        if (!bh || !read_file(e.path().string(), b)) continue;
+        snapshot_hash_[*bh] = state_hash(b);
+    }
+}
+
+bool Chainstate::read_snapshot_file(const Hash256& block, Bytes& out) const {
+    if (!snapshot_hash_.count(block)) return false;
+    return read_file(snapshot_path(block), out);
+}
+
+// Called after connecting a block at a multiple of p_.snapshot_interval.
+void Chainstate::write_commit_snapshot(BlockIndex* idx) {
+    Bytes s = serialize_state();
+    if (!write_file_atomic(snapshot_path(idx->hash), s)) { logf("WARNING: failed to write snapshot"); return; }
+    snapshot_hash_[idx->hash] = state_hash(s);
+    // Keep the newest 3 snapshots on the active chain (plus the one we bootstrapped from).
+    std::vector<std::pair<int64_t, Hash256>> held;
+    for (auto& [bh, sh] : snapshot_hash_) {
+        BlockIndex* b = lookup(bh);
+        held.push_back({b && in_active_chain(b) ? b->height : -1, bh});
+    }
+    std::sort(held.begin(), held.end(), std::greater<>());
+    for (size_t i = 3; i < held.size(); i++) {
+        BlockIndex* b = lookup(held[i].second);
+        if (b && b->from_snapshot) continue;
+        std::error_code ec;
+        fs::remove(snapshot_path(held[i].second), ec);
+        snapshot_hash_.erase(held[i].second);
+    }
+}
+
+std::optional<Hash256> Chainstate::committed_hash_for(const BlockIndex* block) const {
+    if (!block || !best_header_) return std::nullopt;
+    int64_t ch = block->height + p_.snapshot_delay;
+    if (!is_commit_height(ch) || best_header_->height < ch) return std::nullopt;
+    BlockIndex* c = ancestor(best_header_, ch);
+    if (!c || ancestor(c, block->height) != block) return std::nullopt;
+    return c->header.state_commit;
+}
+
+std::optional<std::pair<Hash256, std::string>> Chainstate::best_snapshot_file() const {
+    std::optional<std::pair<Hash256, std::string>> best;
+    int64_t best_h = -1;
+    for (auto& [bh, sh] : snapshot_hash_) {
+        BlockIndex* b = lookup(bh);
+        auto c = committed_hash_for(b);
+        if (!c || *c != sh || b->height <= best_h) continue;
+        best_h = b->height;
+        best = std::make_pair(bh, snapshot_path(bh));
+    }
+    return best;
+}
+
+bool Chainstate::load_snapshot_bytes(const Bytes& snap, std::string* why) {
+    std::lock_guard lock(mu);
+    auto fail = [&](const char* r) { if (why) *why = r; return false; };
+    if (height() > 0) return fail("node-not-fresh");
+    if (snap.size() < 4 + 32 + 1) return fail("short");
+    Reader r(snap);
+    if (r.u32le() != STATE_MAGIC) return fail("bad-magic");
+    Hash256 bh = r.hash();
+    BlockIndex* b = lookup(bh);
+    if (!b) return fail("unknown-block");
+    auto c = committed_hash_for(b);
+    if (!c) return fail("no-commitment-in-best-chain");
+    Hash256 sh = state_hash(snap);
+    if (*c != sh) return fail("hash-mismatch");
+    Hash256 got; int64_t h = 0;
+    if (!parse_state(snap, got, h) || h != b->height) { clear_state(); return fail("parse-failed"); }
+    if (!write_file_atomic(snapshot_path(bh), snap)) return fail("disk-write-failed");
+    snapshot_hash_[bh] = sh;
+    if (!write_file_atomic(dir_ + "/base.dat", Bytes(bh.b.begin(), bh.b.end()))) return fail("disk-write-failed");
+    b->from_snapshot = true;
+    snapshot_base_ = b->height;
+    chain_.assign(b->height + 1, nullptr);
+    for (BlockIndex* w = b; w; w = w->prev) chain_[w->height] = w;
+    txindex_.clear();
+    b->chain_data = true;
+    candidates_.insert(b);
+    for (auto* ch : b->children) update_chain_data(ch);
+    flush();
+    logf("bootstrapped from snapshot at height %lld (%zu coins, %zu tokens, %zu pools)",
+         (long long)b->height, utxo_.size(), tokens_.size(), pools_.size());
+    activate_best_chain();
+    return true;
 }
 
 // ---------------------------------------------------------------- queries
@@ -313,10 +477,42 @@ bool Chainstate::read_block(const BlockIndex* b, Block& out, bool want_witness, 
     return true;
 }
 
-std::optional<Coin> Chainstate::get_coin(const OutPoint& o) const {
+std::optional<Coin> Chainstate::coin(const OutPoint& o) const {
     auto it = utxo_.find(o);
     if (it == utxo_.end()) return std::nullopt;
     return it->second;
+}
+
+std::optional<TokenInfo> Chainstate::token(const Hash256& id) const {
+    auto it = tokens_.find(id);
+    if (it == tokens_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::optional<Pool> Chainstate::pool(const Hash256& t) const {
+    auto it = pools_.find(t);
+    if (it == pools_.end()) return std::nullopt;
+    return it->second;
+}
+
+std::vector<TokenInfo> Chainstate::all_tokens() const {
+    std::vector<TokenInfo> v;
+    for (auto& [id, t] : tokens_) v.push_back(t);
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.id < b.id; });
+    return v;
+}
+
+std::vector<Pool> Chainstate::all_pools() const {
+    std::vector<Pool> v;
+    for (auto& [id, p] : pools_) v.push_back(p);
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.token < b.token; });
+    return v;
+}
+
+std::map<Hash256, Amount> Chainstate::balances_for_address(const Hash256& addr) const {
+    std::map<Hash256, Amount> m;
+    for (auto& [o, c] : coins_for_address(addr)) m[c.out.asset] += c.out.value;
+    return m;
 }
 
 std::vector<std::pair<OutPoint, Coin>> Chainstate::coins_for_address(const Hash256& addr) const {
@@ -340,10 +536,14 @@ ChainStats Chainstate::stats() const {
     s.tip = tip()->hash;
     s.utxo_count = utxo_.size();
     s.supply = supply_;
+    s.issued = issued_through(uint64_t(height()));
+    s.tokens = tokens_.size();
+    s.pools = pools_.size();
     std::error_code ec;
     s.disk_blocks = fs::file_size(dir_ + "/blocks.dat", ec);
     s.disk_headers = fs::file_size(dir_ + "/headers.dat", ec);
     for (auto& e : fs::directory_iterator(dir_ + "/witness", ec)) s.disk_witness += e.file_size(ec);
+    for (auto& e : fs::directory_iterator(dir_ + "/snapshots", ec)) s.disk_snapshots += e.file_size(ec);
     U256 lim = p_.pow_limit;
     U256 cur = U256::from_compact(tip()->header.bits);
     s.difficulty = cur.is_zero() ? 0 : lim.to_double() / cur.to_double();
@@ -355,7 +555,7 @@ ChainStats Chainstate::stats() const {
 void Chainstate::add_coin(const OutPoint& o, const Coin& c) {
     utxo_[o] = c;
     by_addr_[c.out.addr].insert(o);
-    supply_ += c.out.value;
+    if (c.out.is_qnt()) supply_ += c.out.value;
 }
 
 void Chainstate::spend_coin(const OutPoint& o) {
@@ -363,7 +563,7 @@ void Chainstate::spend_coin(const OutPoint& o) {
     if (it == utxo_.end()) return;
     auto a = by_addr_.find(it->second.out.addr);
     if (a != by_addr_.end()) { a->second.erase(o); if (a->second.empty()) by_addr_.erase(a); }
-    supply_ -= it->second.out.value;
+    if (it->second.out.is_qnt()) supply_ -= it->second.out.value;
     utxo_.erase(it);
 }
 
@@ -386,7 +586,8 @@ Chainstate::HeaderResult Chainstate::accept_header(const BlockHeader& h, std::st
     BlockIndex* prev = lookup(h.prev);
     if (!prev) { if (why) *why = "orphan"; return HeaderResult::Orphan; }
     if (prev->failed) return fail("prev-invalid");
-    if (h.version < 1) return fail("bad-version");
+    if (h.version != 2) return fail("bad-version");
+    if (is_commit_height(prev->height + 1) == h.state_commit.is_zero()) return fail("bad-state-commit-presence");
     if (!check_pow(hash, h.bits, p_)) return fail("high-hash");
     if (h.bits != next_bits_for(prev)) return fail("bad-difficulty-bits");
     if (int64_t(h.time) <= median_time_past(prev)) return fail("time-too-old");
@@ -505,6 +706,13 @@ bool Chainstate::write_undo(const BlockIndex* b, const Undo& u) {
     Writer w;
     w.varint(u.spent.size());
     for (auto& [o, c] : u.spent) { w.hash(o.txid); w.varint(o.n); write_coin(w, c); }
+    w.varint(u.pools_before.size());
+    for (auto& [t, p] : u.pools_before) {
+        w.hash(t);
+        if (p) { w.u8(1); write_pool(w, *p); } else w.u8(0);
+    }
+    w.varint(u.tokens_created.size());
+    for (auto& t : u.tokens_created) w.hash(t);
     return write_file_atomic(undo_path(b->hash), w.buf);
 }
 
@@ -518,72 +726,74 @@ bool Chainstate::read_undo(const BlockIndex* b, Undo& u) {
             OutPoint o; o.txid = r.hash(); o.n = uint32_t(r.varint());
             u.spent.push_back({o, read_coin(r)});
         }
+        n = r.varint();
+        for (uint64_t i = 0; i < n; i++) {
+            Hash256 t = r.hash();
+            std::optional<Pool> p;
+            if (r.u8()) p = read_pool(r);
+            u.pools_before.push_back({t, p});
+        }
+        n = r.varint();
+        for (uint64_t i = 0; i < n; i++) u.tokens_created.push_back(r.hash());
     } catch (...) { return false; }
     return true;
 }
 
-enum ConnectResult { CONNECT_OK, CONNECT_INVALID, CONNECT_MISSING };
+void Chainstate::set_pool(const Hash256& token, const std::optional<Pool>& p) {
+    if (auto it = pools_.find(token); it != pools_.end()) { supply_ -= it->second.qnt; pools_.erase(it); }
+    if (p) { pools_[token] = *p; supply_ += p->qnt; }
+}
 
 bool Chainstate::connect_block(BlockIndex* idx, std::string* why) {
+    auto fail = [&](const std::string& r) { if (why) *why = r; return false; };
     Block b;
     bool got_witness = false;
-    if (!read_block(idx, b, true, &got_witness)) { if (why) *why = "read-failed"; return false; }
+    if (!read_block(idx, b, true, &got_witness)) return fail("read-failed");
     bool deep = best_header_ && idx->height + PRUNE_DEPTH <= best_header_->height;
-    if (!got_witness && !deep && idx->height > 0) { if (why) *why = "missing-witness"; return false; }
+    if (!got_witness && !deep && idx->height > 0) return fail("missing-witness");
     bool verify = got_witness && idx->height > 0;
     const uint64_t height = uint64_t(idx->height);
 
-    // Scratch view so a bad tx leaves the UTXO set untouched.
-    std::unordered_map<OutPoint, Coin, OutPointHasher> created;
-    std::unordered_set<OutPoint, OutPointHasher> spent;
-    Undo undo;
-    auto find = [&](const OutPoint& o) -> std::optional<Coin> {
-        if (spent.count(o)) return std::nullopt;
-        if (auto it = created.find(o); it != created.end()) return it->second;
-        if (auto it = utxo_.find(o); it != utxo_.end()) return it->second;
-        return std::nullopt;
-    };
+    // The header must commit to the state snapshot taken p_.snapshot_delay blocks ago.
+    if (is_commit_height(idx->height)) {
+        BlockIndex* base = ancestor(idx, idx->height - p_.snapshot_delay);
+        auto it = base ? snapshot_hash_.find(base->hash) : snapshot_hash_.end();
+        if (it == snapshot_hash_.end()) logf("WARNING: no local snapshot to check the commitment in block %lld", (long long)idx->height);
+        else if (it->second != idx->header.state_commit) return fail("bad-state-commit");
+    }
 
+    // Apply into an overlay so a bad tx leaves the state untouched.
+    LedgerView view(*this);
+    view.apply_coinbase(b.txs[0], height);
     Amount fees = 0;
-    for (size_t ti = 0; ti < b.txs.size(); ti++) {
-        const Transaction& tx = b.txs[ti];
-        Hash256 txid = tx.txid();
-        if (!tx.is_coinbase()) {
-            std::vector<Coin> coins;
-            for (auto& in : tx.ins) {
-                auto c = find(in.prev);
-                if (!c) { if (why) *why = "missing-or-spent-input in " + txid.hex().substr(0, 16); return false; }
-                coins.push_back(*c);
-            }
-            TxResult r = check_tx_inputs(tx, coins, height, p_.genesis_hash, verify);
-            if (!r.ok) { if (why) *why = "tx " + txid.hex().substr(0, 16) + ": " + r.reason; return false; }
-            fees += r.fee;
-            for (size_t i = 0; i < tx.ins.size(); i++) {
-                const OutPoint& o = tx.ins[i].prev;
-                if (created.erase(o) == 0) { spent.insert(o); undo.spent.push_back({o, coins[i]}); }
-            }
-        }
-        for (uint32_t n = 0; n < tx.outs.size(); n++)
-            created[OutPoint{txid, n}] = Coin{tx.outs[n], height, tx.is_coinbase()};
+    for (size_t ti = 1; ti < b.txs.size(); ti++) {
+        TxResult r = view.apply(b.txs[ti], height, p_.genesis_hash, verify);
+        if (!r.ok) return fail("tx " + b.txs[ti].txid().hex().substr(0, 16) + ": " + r.reason);
+        fees += r.fee;
     }
-    if (idx->height > 0 && b.txs[0].total_out() > block_subsidy(height) + fees) {
-        if (why) *why = "coinbase-pays-too-much";
-        return false;
-    }
+    if (idx->height > 0 && b.txs[0].total_qnt_out() > block_subsidy(height) + fees) return fail("coinbase-pays-too-much");
 
-    if (idx->height > 0 && !write_undo(idx, undo)) { if (why) *why = "undo-write-failed"; return false; }
-    for (auto& o : spent) spend_coin(o);
-    for (auto& [o, c] : created) add_coin(o, c);
+    Undo undo;
+    for (auto& [o, c] : view.spent_base()) undo.spent.push_back({o, c});
+    for (auto& [t, p] : view.pools_before()) undo.pools_before.push_back({t, p});
+    for (auto& [id, t] : view.new_tokens()) undo.tokens_created.push_back(id);
+    if (idx->height > 0 && !write_undo(idx, undo)) return fail("undo-write-failed");
+
+    for (auto& [o, c] : view.spent_base()) spend_coin(o);
+    for (auto& [o, c] : view.created()) add_coin(o, c);
+    for (auto& [id, t] : view.new_tokens()) tokens_[id] = t;
+    for (auto& [t, p] : view.pools()) set_pool(t, p);
     chain_.push_back(idx);
     index_block_txs(b, idx, true);
     for (auto& cb : on_connect) cb(b, idx);
+    if (idx->height > 0 && idx->height % p_.snapshot_interval == 0) write_commit_snapshot(idx);
     if (prune_) prune_at(idx->height - PRUNE_DEPTH);
     return true;
 }
 
 bool Chainstate::disconnect_tip(std::string* why) {
     BlockIndex* t = tip();
-    if (t->height == 0) { if (why) *why = "cannot-disconnect-genesis"; return false; }
+    if (t->height == 0 || t->from_snapshot) { if (why) *why = "cannot-disconnect-base"; return false; }
     Block b;
     Undo u;
     if (!read_block(t, b, false) || !read_undo(t, u)) { if (why) *why = "missing-undo-data"; return false; }
@@ -592,6 +802,8 @@ bool Chainstate::disconnect_tip(std::string* why) {
         for (uint32_t n = 0; n < tx.outs.size(); n++) spend_coin(OutPoint{id, n});
     }
     for (auto& [o, c] : u.spent) add_coin(o, c);
+    for (auto& [tok, p] : u.pools_before) set_pool(tok, p);
+    for (auto& id : u.tokens_created) tokens_.erase(id);
     index_block_txs(b, t, false);
     chain_.pop_back();
     for (auto& cb : on_disconnect) cb(b, t);
@@ -648,4 +860,14 @@ void Chainstate::activate_best_chain() {
     }
 }
 
+} // namespace quant
+
+namespace quant {
+Hash256 Chainstate::commit_for_next(BlockIndex* prev) const {
+    int64_t h = prev->height + 1;
+    if (!is_commit_height(h)) return Hash256{};
+    BlockIndex* base = ancestor(prev, h - p_.snapshot_delay);
+    auto s = base ? local_snapshot_hash(base->hash) : std::nullopt;
+    return s ? *s : Hash256{};
+}
 } // namespace quant

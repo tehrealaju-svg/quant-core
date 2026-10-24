@@ -217,7 +217,11 @@ void P2P::on_connected(Peer& p) {
     VersionMsg v;
     v.services = SERVICE_FULL | SERVICE_LIGHT_SERVE;
     v.nonce = nonce_;
-    { std::lock_guard l(cs_.mu); v.height = cs_.height(); }
+    {
+        std::lock_guard l(cs_.mu);
+        v.height = cs_.height();
+        if (cs_.best_snapshot_file()) v.services |= SERVICE_SNAPSHOT;
+    }
     v.listen_port = opt_.listen ? opt_.port : 0;
     v.agent = opt_.agent;
     v.genesis = p_.genesis_hash;
@@ -530,6 +534,49 @@ void P2P::handle(Peer& p, Cmd c, const Bytes& payload) {
         break;
     }
     case Cmd::GetUtxos: send(p, Cmd::Utxos, build_utxo_reply(payload)); break;
+    case Cmd::GetSnapshot: {
+        Hash256 bh = r.hash();
+        uint64_t off = r.varint();
+        if (serve_snap_block_ != bh) {
+            std::lock_guard l(cs_.mu);
+            serve_snap_.clear();
+            serve_snap_block_ = Hash256{};
+            if (cs_.read_snapshot_file(bh, serve_snap_)) serve_snap_block_ = bh;
+        }
+        Writer w;
+        w.hash(bh);
+        if (serve_snap_block_ != bh || off > serve_snap_.size()) { w.varint(0); w.varint(0); w.bytes({}); }
+        else {
+            size_t n = std::min<size_t>(SNAPSHOT_CHUNK, serve_snap_.size() - off);
+            w.varint(serve_snap_.size()); w.varint(off);
+            w.bytes(Bytes(serve_snap_.begin() + off, serve_snap_.begin() + off + n));
+        }
+        send(p, Cmd::Snapshot, w.buf);
+        break;
+    }
+    case Cmd::Snapshot: {
+        Hash256 bh = r.hash();
+        uint64_t total = r.varint(), off = r.varint();
+        Bytes chunk = r.bytes(SNAPSHOT_CHUNK);
+        if (p.id != snap_peer_ || bh != snap_block_) break;
+        if (total == 0 || total > 4ULL << 30 || off != snap_buf_.size() || (snap_total_ && total != snap_total_)) {
+            snap_peer_ = 0; snap_buf_.clear(); snap_total_ = 0; snap_bad_peers_.insert(p.id);
+            break;
+        }
+        snap_total_ = total;
+        snap_buf_.insert(snap_buf_.end(), chunk.begin(), chunk.end());
+        snap_since_ = now_millis();
+        if (snap_buf_.size() < snap_total_) {
+            Writer w; w.hash(bh); w.varint(snap_buf_.size());
+            send(p, Cmd::GetSnapshot, w.buf);
+        } else {
+            std::string why;
+            if (cs_.load_snapshot_bytes(snap_buf_, &why)) logf("fast sync: snapshot from %s accepted", p.addr.str().c_str());
+            else { logf("fast sync: snapshot from %s rejected (%s)", p.addr.str().c_str(), why.c_str()); misbehave(p, "bad snapshot"); }
+            snap_peer_ = 0; snap_buf_.clear(); snap_buf_.shrink_to_fit(); snap_total_ = 0;
+        }
+        break;
+    }
     case Cmd::Utxos: case Cmd::Reject: break;
     }
 }
@@ -586,12 +633,13 @@ Bytes P2P::build_utxo_reply(const Bytes& req) {
             if (want.count(e->tx.outs[i].addr) && !mp_.spends(OutPoint{e->txid, i}))
                 unconf.push_back({OutPoint{e->txid, i}, e->tx.outs[i]});
     w.varint(unconf.size());
-    for (auto& [o, out] : unconf) { w.hash(o.txid); w.varint(o.n); w.varint(out.value); w.u8(out.addr_ver); w.hash(out.addr); }
+    for (auto& [o, out] : unconf) { w.hash(o.txid); w.varint(o.n); write_txout(w, out); }
     return w.buf;
 }
 
 // ---------------------------------------------------------------- block download
 void P2P::request_blocks(int64_t now) {
+    if (opt_.fast_sync && try_fast_sync(now)) return;
     std::map<uint64_t, std::vector<Hash256>> batches;
     {
         std::lock_guard l(cs_.mu);
@@ -893,4 +941,41 @@ void P2P::loop() {
     }
 }
 
+} // namespace quant
+
+namespace quant {
+// Fresh node + long header chain: download the newest committed state snapshot instead of
+// every historical block. Returns true while a snapshot download is in progress.
+bool P2P::try_fast_sync(int64_t now) {
+    Hash256 target;
+    {
+        std::lock_guard l(cs_.mu);
+        if (cs_.height() > 0) return false;
+        BlockIndex* best = cs_.best_header();
+        int64_t max_peer = 0;
+        for (auto& pp : peers_) if (pp->active()) max_peer = std::max(max_peer, pp->best_height);
+        if (!best || best->height + 10 < max_peer) return snap_peer_ != 0; // still fetching headers
+        int64_t s = (best->height - p_.snapshot_delay) / p_.snapshot_interval * p_.snapshot_interval;
+        if (s <= 0) return false;
+        BlockIndex* b = cs_.ancestor(best, s);
+        if (!b || !cs_.committed_hash_for(b)) return false;
+        target = b->hash;
+    }
+    if (snap_peer_) {
+        if (now - snap_since_ < 60000) return true;
+        snap_bad_peers_.insert(snap_peer_); // stalled
+        snap_peer_ = 0; snap_buf_.clear(); snap_total_ = 0;
+    }
+    for (auto& pp : peers_) {
+        if (!pp->active() || !(pp->ver.services & SERVICE_SNAPSHOT) || snap_bad_peers_.count(pp->id)) continue;
+        snap_peer_ = pp->id;
+        snap_block_ = target;
+        snap_since_ = now;
+        Writer w; w.hash(target); w.varint(0);
+        send(*pp, Cmd::GetSnapshot, w.buf);
+        logf("fast sync: downloading state snapshot from %s", pp->addr.str().c_str());
+        return true;
+    }
+    return false; // nobody serves snapshots: fall back to downloading blocks
+}
 } // namespace quant

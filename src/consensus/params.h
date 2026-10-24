@@ -25,6 +25,9 @@ struct ChainParams {
     Hash256 genesis_hash;
     uint8_t dht_infohash[20];   // key used to find peers on the BitTorrent DHT
     uint16_t lan_port;          // UDP port for LAN discovery broadcasts
+    int64_t snapshot_interval = 10080; // state snapshot every N blocks (~2 weeks)
+    int64_t snapshot_delay = 100;      // committed in the header this many blocks later
+    bool is_commit_height(int64_t h) const { return h >= snapshot_interval + snapshot_delay && h % snapshot_interval == snapshot_delay; }
 
     std::string address_hrp() const { return hrp; }
 };

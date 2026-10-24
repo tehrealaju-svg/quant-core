@@ -157,7 +157,7 @@ bool Wallet::change_password(const std::string& old_pw, const std::string& new_p
 
 Bytes Wallet::serialize() const {
     Writer w;
-    w.u32le(2); // format version
+    w.u32le(3); // format version
     w.str(p_.name);
     w.str(mnemonic_);
     w.str(passphrase_);
@@ -168,20 +168,23 @@ Bytes Wallet::serialize() const {
     w.varint(keys_.size());
     for (auto& k : keys_) {
         w.varint(k.index);
-        w.raw(k.kp.falcon_pk); w.raw(k.kp.falcon_sk); w.raw(k.kp.sphincs_pk); w.raw(k.kp.sphincs_sk);
+        w.raw(k.kp.pk); w.raw(k.kp.sk);
         w.str(k.label);
         w.u8(k.issued);
     }
     w.varint(coins_.size());
     for (auto& [o, c] : coins_) {
         w.hash(o.txid); w.varint(o.n);
-        w.varint(c.out.value); w.u8(c.out.addr_ver); w.hash(c.out.addr);
+        write_txout(w, c.out);
         w.u64le(uint64_t(c.height)); w.u8(c.coinbase); w.u8(c.locked);
     }
     w.varint(history_.size());
     for (auto& [h, t] : history_) {
         w.hash(t.txid); w.u64le(uint64_t(t.height)); w.u64le(uint64_t(t.time)); w.u64le(uint64_t(t.delta));
         w.varint(t.fee); w.str(t.counterparty); w.str(t.note); w.u8(t.coinbase);
+        w.str(t.kind);
+        w.varint(t.token_delta.size());
+        for (auto& [a, d] : t.token_delta) { w.hash(a); w.u64le(uint64_t(d)); }
     }
     w.varint(contacts.size());
     for (auto& c : contacts) { w.str(c.name); w.str(c.address); }
@@ -191,7 +194,7 @@ Bytes Wallet::serialize() const {
 bool Wallet::deserialize(const Bytes& b) {
     try {
         Reader r(b);
-        if (r.u32le() != 2) return false;
+        if (r.u32le() != 3) return false;
         if (r.str(32) != p_.name) return false;
         mnemonic_ = r.str(1000);
         passphrase_ = r.str(1000);
@@ -206,8 +209,7 @@ bool Wallet::deserialize(const Bytes& b) {
         for (size_t i = 0; i < nk; i++) {
             WalletKey k;
             k.index = uint32_t(r.varint());
-            k.kp.falcon_pk = r.raw(FALCON_PK_BYTES); k.kp.falcon_sk = r.raw(FALCON_SK_BYTES);
-            k.kp.sphincs_pk = r.raw(SPHINCS_PK_BYTES); k.kp.sphincs_sk = r.raw(SPHINCS_SK_BYTES);
+            k.kp.pk = r.raw(FALCON_PK_BYTES); k.kp.sk = r.raw(FALCON_SK_BYTES);
             k.label = r.str(200);
             k.issued = r.u8() != 0;
             k.addr = k.kp.address_hash();
@@ -218,7 +220,7 @@ bool Wallet::deserialize(const Bytes& b) {
         for (size_t i = 0; i < nc; i++) {
             WalletCoin c;
             c.op.txid = r.hash(); c.op.n = uint32_t(r.varint());
-            c.out.value = r.varint(); c.out.addr_ver = r.u8(); c.out.addr = r.hash();
+            c.out = read_txout(r);
             c.height = int64_t(r.u64le()); c.coinbase = r.u8() != 0; c.locked = r.u8() != 0;
             coins_[c.op] = c;
         }
@@ -227,6 +229,9 @@ bool Wallet::deserialize(const Bytes& b) {
             WalletTx t;
             t.txid = r.hash(); t.height = int64_t(r.u64le()); t.time = int64_t(r.u64le()); t.delta = int64_t(r.u64le());
             t.fee = r.varint(); t.counterparty = r.str(200); t.note = r.str(1000); t.coinbase = r.u8() != 0;
+            t.kind = r.str(32);
+            size_t nd = r.varint_max(1000);
+            for (size_t j = 0; j < nd; j++) { Hash256 a = r.hash(); t.token_delta[a] = int64_t(r.u64le()); }
             history_[t.txid] = t;
         }
         size_t nct = r.varint();
@@ -314,12 +319,20 @@ Balance Wallet::balance(int64_t tip) const {
     std::lock_guard l(mu);
     Balance b;
     for (auto& [o, c] : coins_) {
+        if (!c.out.is_qnt()) continue;
         if (c.locked) b.locked += c.out.value;
         else if (c.height < 0) b.unconfirmed += c.out.value;
         else if (!mature(c, tip)) b.immature += c.out.value;
         else b.confirmed += c.out.value;
     }
     return b;
+}
+
+std::map<Hash256, Amount> Wallet::token_balances() const {
+    std::lock_guard l(mu);
+    std::map<Hash256, Amount> m;
+    for (auto& [o, c] : coins_) if (!c.out.is_qnt() && !c.locked) m[c.out.asset] += c.out.value;
+    return m;
 }
 
 std::vector<WalletTx> Wallet::history() const {
@@ -336,38 +349,52 @@ std::vector<WalletTx> Wallet::history() const {
 
 void Wallet::process_tx(const Transaction& tx, int64_t height, int64_t time) {
     Hash256 txid = tx.txid();
-    Amount our_in = 0;
-    bool all_ours = !tx.is_coinbase();
+    std::map<Hash256, int64_t> delta; // per asset, zero id = QNT
+    Amount qnt_in = 0;
+    bool any = false, all_ours = !tx.is_coinbase();
     for (auto& in : tx.ins) {
         auto it = coins_.find(in.prev);
         if (it == coins_.end()) { all_ours = false; continue; }
-        our_in += it->second.out.value;
+        any = true;
+        delta[it->second.out.asset] -= int64_t(it->second.out.value);
+        if (it->second.out.is_qnt()) qnt_in += it->second.out.value;
         if (height < 0) it->second.locked = true;
         else coins_.erase(it);
     }
-    Amount our_out = 0;
     std::string counterparty;
     for (uint32_t n = 0; n < tx.outs.size(); n++) {
         const TxOut& o = tx.outs[n];
         if (is_mine(o.addr)) {
-            our_out += o.value;
+            any = true;
+            delta[o.asset] += int64_t(o.value);
             add_coin(WalletCoin{OutPoint{txid, n}, o, height, tx.is_coinbase(), false});
         } else if (counterparty.empty()) {
             counterparty = address_string(o.addr);
         }
     }
-    if (our_in == 0 && our_out == 0) return;
+    if (!any) return;
     WalletTx& t = history_[txid];
     bool fresh = t.txid.is_zero();
     t.txid = txid;
     t.height = height;
     if (fresh) t.time = time;
-    t.delta = int64_t(our_out) - int64_t(our_in);
+    t.delta = delta[QNT_ASSET];
+    t.token_delta.clear();
+    for (auto& [a, d] : delta) if (!a.is_zero() && d) t.token_delta[a] = d;
     t.coinbase = tx.is_coinbase();
     if (!counterparty.empty()) t.counterparty = counterparty;
-    if (all_ours && our_in > 0) {
-        Amount in_total = our_in, out_total = tx.total_out();
-        t.fee = in_total > out_total ? in_total - out_total : 0;
+    // Fee = QNT that went in (inputs + released by ops) minus QNT that came out (outputs + absorbed).
+    int64_t op_q = 0;
+    for (auto& op : tx.ops) {
+        if (std::holds_alternative<OpCreateToken>(op)) t.kind = "token-create";
+        else if (auto* s = std::get_if<OpSwap>(&op)) { t.kind = "swap"; op_q += s->sell ? int64_t(s->out) : -int64_t(s->in); }
+        else if (auto* p = std::get_if<OpPoolCreate>(&op)) { t.kind = "liquidity"; op_q -= int64_t(p->qnt); }
+        else if (auto* a = std::get_if<OpAddLiquidity>(&op)) { t.kind = "liquidity"; op_q -= int64_t(a->qnt); }
+        else if (auto* r = std::get_if<OpRemoveLiquidity>(&op)) { t.kind = "liquidity"; op_q += int64_t(r->qnt); }
+    }
+    if (all_ours && qnt_in > 0) {
+        int64_t f = int64_t(qnt_in) + op_q - int64_t(tx.total_qnt_out());
+        t.fee = f > 0 ? Amount(f) : 0;
     }
 }
 
@@ -408,13 +435,13 @@ void Wallet::abandon_unconfirmed() {
 }
 
 // ---------------------------------------------------------------- building + signing
-static size_t estimate_size(size_t n_in, size_t n_unique, size_t n_out, bool backup) {
-    size_t core = 4 + n_in * (32 + 5) + n_out * (9 + 1 + 32) + 4;
-    size_t sig = backup ? (1 + SPHINCS_PK_BYTES + 32 + SPHINCS_SIG_BYTES) : (1 + FALCON_PK_BYTES + 32 + 2 + FALCON_SIG_MAX);
+static size_t estimate_size(size_t n_in, size_t n_unique, size_t n_out, size_t n_ops) {
+    size_t core = 8 + n_in * (32 + 5) + n_out * (9 + 33 + 32) + n_ops * 160 + 4;
+    size_t sig = 1 + FALCON_PK_BYTES + 2 + FALCON_SIG_MAX;
     return core + 3 + n_unique * sig + (n_in - n_unique) * 4;
 }
 
-bool Wallet::sign_tx(Transaction& tx, const std::vector<WalletCoin>& inputs, bool use_backup, std::string* err) {
+bool Wallet::sign_tx(Transaction& tx, const std::vector<WalletCoin>& inputs, std::string* err) {
     Hash256 sighash = signature_hash(p_.genesis_hash, tx.txid());
     tx.witness.clear();
     std::map<Hash256, uint32_t> first_use;
@@ -425,102 +452,215 @@ bool Wallet::sign_tx(Transaction& tx, const std::vector<WalletCoin>& inputs, boo
         auto k = by_addr_.find(a);
         if (k == by_addr_.end()) { if (err) *err = "missing key"; return false; }
         const KeyPair& kp = keys_[k->second].kp;
-        if (use_backup)
-            tx.witness.push_back(WitnessSphincs{kp.sphincs_pk, kp.falcon_pkhash(), sphincs_sign(kp.sphincs_sk, sighash)});
-        else
-            tx.witness.push_back(WitnessFalcon{kp.falcon_pk, kp.sphincs_pkhash(), falcon_sign(kp.falcon_sk, sighash)});
+        tx.witness.push_back(WitnessFalcon{kp.pk, falcon_sign(kp.sk, sighash)});
         first_use[a] = i;
     }
     return true;
 }
 
-bool Wallet::build(const std::vector<TxOut>& outs_in, std::vector<WalletCoin> pool, Amount fee_per_kb, bool use_backup,
-                   bool subtract_fee, bool sweep, Transaction& out, Amount* fee_out, std::string* err) {
+Hash256 Wallet::change_addr() {
+    std::string ca = new_address("(change)");
+    uint8_t v; Hash256 h;
+    decode_address(p_, ca, v, h);
+    return h;
+}
+
+bool Wallet::build(Plan plan, int64_t tip, Amount fee_per_kb, Transaction& out, Amount* fee_out, std::string* err) {
     if (fee_per_kb < MIN_RELAY_FEE_PER_KB) fee_per_kb = MIN_RELAY_FEE_PER_KB;
-    Amount target = 0;
-    for (auto& o : outs_in) target += o.value;
-    std::sort(pool.begin(), pool.end(), [](auto& a, auto& b) { return a.out.value > b.out.value; });
+    auto spendable = [&](const WalletCoin& c) { return !c.locked && c.height >= 0 && mature(c, tip); };
+
+    // Net amount each asset needs from our coins: outputs + absorbed by ops - released by ops.
+    std::map<Hash256, __int128> need;
+    for (auto& o : plan.outs) need[o.asset] += o.value;
+    for (auto& [a, v] : plan.op_in) need[a] += v;
+    for (auto& [a, v] : plan.op_out) need[a] -= v;
 
     std::vector<WalletCoin> sel;
-    Amount sel_total = 0;
+    std::vector<TxOut> change;
+    // Tokens first (no fee in tokens).
+    for (auto& [asset, n] : need) {
+        if (asset.is_zero()) continue;
+        Amount have = 0;
+        if (n > 0) {
+            std::vector<WalletCoin> pool;
+            for (auto& [o, c] : coins_) if (c.out.asset == asset && spendable(c)) pool.push_back(c);
+            std::sort(pool.begin(), pool.end(), [](auto& a, auto& b) { return a.out.value > b.out.value; });
+            for (auto& c : pool) {
+                if (__int128(have) >= n) break;
+                sel.push_back(c);
+                have += c.out.value;
+            }
+            if (__int128(have) < n) { if (err) *err = "insufficient token balance"; return false; }
+        }
+        __int128 left = __int128(have) - n;
+        if (left > 0) change.push_back(TxOut{Amount(left), asset, Hash256{}});
+    }
+
+    // QNT: inputs to cover the net need plus the fee (always at least one input).
+    std::vector<WalletCoin> qpool = plan.sweep ? plan.sweep_coins : std::vector<WalletCoin>{};
+    if (!plan.sweep)
+        for (auto& [o, c] : coins_) if (c.out.is_qnt() && spendable(c)) qpool.push_back(c);
+    std::sort(qpool.begin(), qpool.end(), [](auto& a, auto& b) { return a.out.value > b.out.value; });
+    __int128 qneed = need.count(QNT_ASSET) ? need[QNT_ASSET] : 0;
+    Amount qhave = 0, fee = 0;
+    size_t qi = 0, qcount = 0;
     auto unique_addrs = [&] {
         std::set<Hash256> s;
         for (auto& c : sel) s.insert(c.out.addr);
-        return s.size();
+        return std::max<size_t>(s.size(), 1);
     };
-    size_t i = 0;
-    Amount fee = 0;
     for (;;) {
-        size_t n_out = outs_in.size() + (sweep ? 0 : 1);
-        fee = Amount(estimate_size(std::max<size_t>(sel.size(), 1), std::max<size_t>(unique_addrs(), 1), n_out, use_backup)) * fee_per_kb / 1000;
-        Amount need = subtract_fee ? target : target + fee;
-        if (!sel.empty() && sel_total >= need && !sweep) break;
-        if (i >= pool.size()) {
-            if (sweep && !sel.empty()) break;
-            if (err) *err = "insufficient funds: have " + format_amount(sel_total) + ", need " + format_amount(need);
+        size_t n_out = plan.outs.size() + change.size() + plan.extra_outs + (plan.sweep ? 0 : 1);
+        fee = Amount(estimate_size(std::max<size_t>(sel.size(), 1), unique_addrs(), n_out, plan.ops.size())) * fee_per_kb / 1000;
+        __int128 want = plan.subtract_fee ? qneed : qneed + fee;
+        if (qcount > 0 && __int128(qhave) >= want && !plan.sweep) break;
+        if (qi >= qpool.size()) {
+            if (plan.sweep && qcount) break;
+            if (err) *err = "insufficient QNT: have " + format_amount(qhave) + ", need " + format_amount(Amount(want > 0 ? want : 0));
             return false;
         }
-        sel.push_back(pool[i]);
-        sel_total += pool[i].out.value;
-        i++;
+        sel.push_back(qpool[qi]);
+        qhave += qpool[qi].out.value;
+        qi++; qcount++;
         if (sel.size() > 2000) { if (err) *err = "too many small coins; sweep first"; return false; }
     }
 
     Transaction tx;
     for (auto& c : sel) tx.ins.push_back(TxIn{c.op});
-    tx.outs = outs_in;
-    if (sweep) tx.outs[0].value = sel_total;
-    if (subtract_fee || sweep) {
+    tx.outs = plan.outs;
+    tx.ops = plan.ops;
+    if (plan.sweep) tx.outs[0].value = qhave;
+    if (plan.subtract_fee || plan.sweep) {
         if (tx.outs[0].value <= fee + DUST_LIMIT) { if (err) *err = "amount too small to cover the fee"; return false; }
         tx.outs[0].value -= fee;
     }
-    Amount spent = tx.total_out();
-    if (!sweep) {
-        Amount change = sel_total - spent - (subtract_fee ? 0 : fee);
-        if (subtract_fee) change = sel_total - spent - fee;
-        if (change >= DUST_LIMIT) {
-            std::string ca = new_address("(change)");
-            uint8_t v; Hash256 h;
-            decode_address(p_, ca, v, h);
-            tx.outs.push_back(TxOut{change, ADDR_V0, h});
-        }
+    if (!plan.sweep) {
+        __int128 qchange = __int128(qhave) - qneed - (plan.subtract_fee ? 0 : fee);
+        if (qchange >= DUST_LIMIT) change.push_back(TxOut{Amount(qchange), QNT_ASSET, Hash256{}});
         // else: leftover dust goes to the miner as extra fee
     }
+    if (!change.empty()) {
+        Hash256 ca = change_addr();
+        for (auto& c : change) { c.addr = ca; tx.outs.push_back(c); }
+    }
+    if (plan.finish) plan.finish(tx);
     tx.lock_height = 0;
-    if (!sign_tx(tx, sel, use_backup, err)) return false;
-    Amount actual_fee = sel_total - tx.total_out();
+    if (!sign_tx(tx, sel, err)) return false;
+    __int128 actual = __int128(qhave) + (plan.op_out.count(QNT_ASSET) ? plan.op_out[QNT_ASSET] : 0) -
+                      tx.total_qnt_out() - (plan.op_in.count(QNT_ASSET) ? plan.op_in[QNT_ASSET] : 0);
     Amount min_fee = Amount(tx.full_size()) * MIN_RELAY_FEE_PER_KB / 1000;
-    if (actual_fee < min_fee) { if (err) *err = "internal fee estimate too low"; return false; }
+    if (actual < __int128(min_fee)) { if (err) *err = "internal fee estimate too low"; return false; }
     out = std::move(tx);
-    if (fee_out) *fee_out = actual_fee;
+    if (fee_out) *fee_out = Amount(actual);
     return true;
 }
 
 bool Wallet::create_tx(const std::vector<Dest>& dests, Amount fee_per_kb, int64_t tip, Transaction& out,
-                       Amount* fee_out, std::string* err, bool use_backup, bool subtract_fee) {
+                       Amount* fee_out, std::string* err, bool subtract_fee) {
     std::lock_guard l(mu);
     if (dests.empty()) { if (err) *err = "no recipients"; return false; }
-    std::vector<TxOut> outs;
+    Plan plan;
     for (auto& d : dests) {
         uint8_t v; Hash256 h;
-        if (!decode_address(p_, d.address, v, h) || v != ADDR_V0) { if (err) *err = "invalid address: " + d.address; return false; }
-        if (d.amount < DUST_LIMIT) { if (err) *err = "minimum amount is 0.000001 QNT"; return false; }
-        outs.push_back(TxOut{d.amount, v, h});
+        if (!decode_address(p_, d.address, v, h) || v != 0) { if (err) *err = "invalid address: " + d.address; return false; }
+        if (d.asset.is_zero() && d.amount < DUST_LIMIT) { if (err) *err = "minimum amount is 0.000001 QNT"; return false; }
+        if (d.amount == 0) { if (err) *err = "amount must be positive"; return false; }
+        plan.outs.push_back(TxOut{d.amount, d.asset, h});
     }
-    std::vector<WalletCoin> pool;
-    for (auto& [o, c] : coins_) if (!c.locked && c.height >= 0 && mature(c, tip)) pool.push_back(c);
-    return build(outs, pool, fee_per_kb, use_backup, subtract_fee, false, out, fee_out, err);
+    if (subtract_fee && !plan.outs[0].is_qnt()) { if (err) *err = "can only subtract the fee from a QNT payment"; return false; }
+    plan.subtract_fee = subtract_fee;
+    return build(std::move(plan), tip, fee_per_kb, out, fee_out, err);
 }
 
 bool Wallet::create_sweep(const std::string& address, Amount fee_per_kb, int64_t tip, Transaction& out,
-                          Amount* fee_out, std::string* err, bool use_backup) {
+                          Amount* fee_out, std::string* err) {
     std::lock_guard l(mu);
     uint8_t v; Hash256 h;
     if (!decode_address(p_, address, v, h)) { if (err) *err = "invalid address"; return false; }
-    std::vector<WalletCoin> pool;
-    for (auto& [o, c] : coins_) if (!c.locked && c.height >= 0 && mature(c, tip)) pool.push_back(c);
-    if (pool.empty()) { if (err) *err = "nothing to sweep"; return false; }
-    return build({TxOut{0, v, h}}, pool, fee_per_kb, use_backup, false, true, out, fee_out, err);
+    Plan plan;
+    for (auto& [o, c] : coins_) if (c.out.is_qnt() && !c.locked && c.height >= 0 && mature(c, tip)) plan.sweep_coins.push_back(c);
+    if (plan.sweep_coins.empty()) { if (err) *err = "nothing to sweep"; return false; }
+    plan.sweep = true;
+    plan.outs.push_back(TxOut{0, QNT_ASSET, h});
+    return build(std::move(plan), tip, fee_per_kb, out, fee_out, err);
+}
+
+bool Wallet::create_token(const OpCreateToken& t, Amount fee_per_kb, int64_t tip, Transaction& out, Hash256* token_out,
+                          Amount* fee_out, std::string* err) {
+    std::lock_guard l(mu);
+    Plan plan;
+    plan.ops.push_back(t);
+    plan.extra_outs = 1;
+    Hash256 owner = change_addr();
+    Hash256 id;
+    plan.finish = [&](Transaction& tx) {
+        id = token_id(tx.ins[0].prev, 0);
+        tx.outs.push_back(TxOut{t.supply, id, owner});
+    };
+    TxResult basic;
+    if (!valid_ticker(t.ticker)) { if (err) *err = "ticker must be 1-10 characters A-Z / 0-9"; return false; }
+    if (!valid_token_text(t.name, 1, MAX_TOKEN_NAME)) { if (err) *err = "name must be 1-32 printable characters"; return false; }
+    if (!valid_token_text(t.uri, 0, MAX_TOKEN_URI)) { if (err) *err = "uri must be at most 120 printable characters"; return false; }
+    if (t.decimals > MAX_TOKEN_DECIMALS) { if (err) *err = "decimals must be 0-10"; return false; }
+    if (t.supply == 0 || t.supply > MAX_TOKEN_SUPPLY) { if (err) *err = "supply out of range"; return false; }
+    if (!build(std::move(plan), tip, fee_per_kb, out, fee_out, err)) return false;
+    if (token_out) *token_out = id;
+    return true;
+}
+
+bool Wallet::swap(const Hash256& token, bool sell, Amount in, Amount min_out, Amount fee_per_kb, int64_t tip,
+                  Transaction& out, Amount* fee_out, std::string* err) {
+    std::lock_guard l(mu);
+    if (in == 0 || min_out == 0) { if (err) *err = "amounts must be positive"; return false; }
+    if (!sell && min_out == 0) return false;
+    if (sell && min_out < DUST_LIMIT) { if (err) *err = "you would receive less than 0.000001 QNT"; return false; }
+    Plan plan;
+    plan.ops.push_back(OpSwap{token, sell, in, min_out});
+    plan.op_in[sell ? token : QNT_ASSET] = in;
+    plan.op_out[sell ? QNT_ASSET : token] = min_out;
+    return build(std::move(plan), tip, fee_per_kb, out, fee_out, err);
+}
+
+bool Wallet::add_liquidity(const Hash256& token, Amount qnt, Amount tok, const std::optional<Pool>& pool, Amount fee_per_kb,
+                           int64_t tip, Transaction& out, Amount* shares_out, Amount* fee_out, std::string* err) {
+    std::lock_guard l(mu);
+    if (!qnt || !tok) { if (err) *err = "amounts must be positive"; return false; }
+    Plan plan;
+    Amount shares;
+    if (!pool) {
+        Amount total = amm_initial_shares(qnt, tok);
+        if (total <= MIN_LIQUIDITY) { if (err) *err = "first deposit too small"; return false; }
+        shares = total - MIN_LIQUIDITY;
+        plan.ops.push_back(OpPoolCreate{token, qnt, tok, shares});
+    } else {
+        shares = amm_add_shares(*pool, qnt, tok);
+        if (!shares) { if (err) *err = "deposit too small"; return false; }
+        plan.ops.push_back(OpAddLiquidity{token, qnt, tok, shares});
+    }
+    plan.op_in[QNT_ASSET] = qnt;
+    plan.op_in[token] = tok;
+    plan.op_out[pool_share_id(token)] = shares;
+    if (!build(std::move(plan), tip, fee_per_kb, out, fee_out, err)) return false;
+    if (shares_out) *shares_out = shares;
+    return true;
+}
+
+bool Wallet::remove_liquidity(const Hash256& token, Amount shares, const Pool& pool, Amount fee_per_kb, int64_t tip,
+                              Transaction& out, Amount* qnt_out, Amount* tok_out, Amount* fee_out, std::string* err) {
+    std::lock_guard l(mu);
+    if (!shares || shares > pool.shares - MIN_LIQUIDITY) { if (err) *err = "bad share amount"; return false; }
+    Amount q, t;
+    amm_remove_amounts(pool, shares, q, t);
+    if (!q && !t) { if (err) *err = "too few shares"; return false; }
+    Plan plan;
+    plan.ops.push_back(OpRemoveLiquidity{token, shares, q, t});
+    plan.op_in[pool_share_id(token)] = shares;
+    if (q) plan.op_out[QNT_ASSET] = q;
+    if (t) plan.op_out[token] = t;
+    if (!build(std::move(plan), tip, fee_per_kb, out, fee_out, err)) return false;
+    if (qnt_out) *qnt_out = q;
+    if (tok_out) *tok_out = t;
+    return true;
 }
 
 } // namespace quant

@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "consensus/limits.h"
 #include "crypto/hash.h"
@@ -16,12 +17,39 @@ namespace quant {
 static constexpr uint64_t MAINNET_GENESIS_TIME = 0;
 static const char* MAINNET_GENESIS_MESSAGE = "Quant: post-quantum money for everyone";
 
+// issued_through(h) is a pure function of height (subsidies never depend on fees), computed by
+// stepping the curve. Checkpoints every 4096 blocks keep any lookup to <= 4096 steps; once the
+// tail is reached it is linear.
+static std::mutex g_emission_mu;
+static std::vector<Amount> g_issued_at; // g_issued_at[k] = issued_through(k * 4096)
+static uint64_t g_tail_height = 0;      // first height paying exactly TAIL_SUBSIDY (0 = not found yet)
+static Amount g_tail_base = 0;          // issued_through(g_tail_height - 1)
+
+Amount issued_through(uint64_t height) {
+    constexpr uint64_t STEP = 4096;
+    std::lock_guard l(g_emission_mu);
+    if (g_issued_at.empty()) g_issued_at.push_back(0); // genesis pays nothing
+    if (g_tail_height && height >= g_tail_height) return g_tail_base + (height - g_tail_height + 1) * TAIL_SUBSIDY;
+    while ((g_issued_at.size() - 1) * STEP < height && !g_tail_height) {
+        uint64_t h = (g_issued_at.size() - 1) * STEP;
+        Amount iss = g_issued_at.back();
+        for (uint64_t i = 1; i <= STEP; i++) {
+            Amount s = subsidy_after(iss);
+            if (s == TAIL_SUBSIDY && !g_tail_height) { g_tail_height = h + i; g_tail_base = iss; }
+            iss += s;
+        }
+        g_issued_at.push_back(iss);
+    }
+    if (g_tail_height && height >= g_tail_height) return g_tail_base + (height - g_tail_height + 1) * TAIL_SUBSIDY;
+    uint64_t k = height / STEP;
+    Amount iss = g_issued_at[k];
+    for (uint64_t h = k * STEP + 1; h <= height; h++) iss += subsidy_after(iss);
+    return iss;
+}
+
 Amount block_subsidy(uint64_t height) {
     if (height == 0) return 0;
-    uint64_t era = (height - 1) / HALVING_INTERVAL;
-    if (era >= 63) return 0;
-    Amount r = INITIAL_SUBSIDY >> era;
-    return r < MIN_SUBSIDY ? 0 : r;
+    return subsidy_after(issued_through(height - 1));
 }
 
 Block make_genesis(uint64_t time, uint32_t bits, const std::string& msg) {
@@ -32,7 +60,7 @@ Block make_genesis(uint64_t time, uint32_t bits, const std::string& msg) {
     if (cb.extra.size() > MAX_COINBASE_EXTRA) cb.extra.resize(MAX_COINBASE_EXTRA);
     // No outputs: nobody owns the genesis reward (no premine).
     b.txs.push_back(cb);
-    b.header.version = 1;
+    b.header.version = 2;
     b.header.time = time;
     b.header.bits = bits;
     b.header.nonce = 0;
@@ -44,7 +72,7 @@ Block make_genesis(uint64_t time, uint32_t bits, const std::string& msg) {
 static void finish(ChainParams& p) {
     p.genesis = make_genesis(p.genesis_time, p.genesis_bits, p.genesis_message);
     p.genesis_hash = p.genesis.header.hash();
-    std::string key = "Quant DHT v1 " + p.name + " " + p.genesis_hash.hex();
+    std::string key = "Quant DHT v2 " + p.name + " " + p.genesis_hash.hex();
     Hash256 h = blake3((const uint8_t*)key.data(), key.size());
     std::memcpy(p.dht_infohash, h.data(), 20);
 }
@@ -55,7 +83,7 @@ static std::unique_ptr<ChainParams> build(Network n) {
     switch (n) {
     case Network::Main:
         p->name = "main"; p->hrp = "qnt";
-        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0xa1;
+        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0xb2;
         p->p2p_port = 7337; p->rpc_port = 7338; p->lan_port = 7339;
         p->pow_limit = (U256(1) << 236) - U256(1);
         p->genesis_bits = (U256(1) << 226).to_compact();
@@ -65,22 +93,24 @@ static std::unique_ptr<ChainParams> build(Network n) {
         break;
     case Network::Test:
         p->name = "test"; p->hrp = "tqnt";
-        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0x7e;
+        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0x82;
         p->p2p_port = 17337; p->rpc_port = 17338; p->lan_port = 17339;
         p->pow_limit = (U256(1) << 240) - U256(1);
         p->genesis_bits = (U256(1) << 230).to_compact();
-        p->genesis_time = 1790121600; // 2026-09-23
-        p->genesis_message = "Quant testnet 2026-09-23";
+        p->genesis_time = 1792800000; // 2026-10-24
+        p->genesis_message = "Quant v2 testnet 2026-10-24";
         break;
     case Network::Regtest:
         p->name = "regtest"; p->hrp = "rqnt";
-        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0x0f;
+        p->magic[0] = 0x51; p->magic[1] = 0x4e; p->magic[2] = 0x54; p->magic[3] = 0x20;
         p->p2p_port = 27337; p->rpc_port = 27338; p->lan_port = 27339;
         p->pow_limit = (U256(1) << 255) - U256(1);
         p->genesis_bits = p->pow_limit.to_compact();
         p->no_retarget = true;
+        p->snapshot_interval = 50;
+        p->snapshot_delay = 5;
         p->genesis_time = 1790121600;
-        p->genesis_message = "Quant regtest";
+        p->genesis_message = "Quant v2 regtest";
         break;
     }
     finish(*p);

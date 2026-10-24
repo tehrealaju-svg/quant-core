@@ -15,8 +15,9 @@ Block create_block_template(Chainstate& cs, Mempool& mp, const Hash256& payout, 
     BlockIndex* tip = cs.tip();
     int64_t height = tip->height + 1;
     Block b;
-    b.header.version = 1;
+    b.header.version = 2;
     b.header.prev = tip->hash;
+    b.header.state_commit = cs.commit_for_next(tip);
     b.header.bits = cs.next_bits_for(tip);
     b.header.time = uint64_t(std::max<int64_t>(now_seconds(), cs.median_time_past(tip) + 1));
 
@@ -29,7 +30,7 @@ Block create_block_template(Chainstate& cs, Mempool& mp, const Hash256& payout, 
     Amount fees = 0;
     auto sel = mp.select_for_block(MAX_BLOCK_SIZE - 2000, &fees);
     Amount reward = block_subsidy(uint64_t(height)) + fees;
-    if (reward > 0) cb.outs.push_back(TxOut{reward, ADDR_V0, payout}); // no output once rewards end and fees are 0
+    if (reward > 0) cb.outs.push_back(TxOut{reward, QNT_ASSET, payout}); // no output once rewards end and fees are 0
     b.txs.push_back(cb);
     for (auto* e : sel) b.txs.push_back(e->tx);
     b.header.merkle_root = b.compute_merkle_root();

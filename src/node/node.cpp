@@ -162,15 +162,15 @@ void Node::wallet_refresh_coins() {
 }
 
 std::string Node::send(const std::vector<Wallet::Dest>& dests, Amount fee_per_kb, bool subtract_fee,
-                       const std::string& note, bool use_backup) {
+                       const std::string& note) {
     if (!wallet_) throw RpcError("no wallet loaded");
     Transaction tx;
     Amount fee = 0;
     std::string err;
     int64_t h;
     { std::lock_guard l(cs_->mu); h = cs_->height(); }
-    if (!wallet_->create_tx(dests, fee_per_kb, h, tx, &fee, &err, use_backup, subtract_fee)) throw RpcError(err);
-    logf("sending %s QNT fee", format_amount(fee).c_str());
+    if (!wallet_->create_tx(dests, fee_per_kb, h, tx, &fee, &err, subtract_fee)) throw RpcError(err);
+    logf("sending, fee %s QNT", format_amount(fee).c_str());
     return broadcast(tx, note);
 }
 

@@ -2,24 +2,26 @@
 //   frame = magic[4] | cmd u8 | len u32le | checksum[4] | payload[len]
 #pragma once
 #include "consensus/params.h"
-#include "consensus/tx_check.h"
+#include "consensus/ledger.h"
 #include "net/socket.h"
 
 namespace quant {
 
-constexpr uint32_t PROTOCOL_VERSION = 2; // 2: IPv6 addresses
+constexpr uint32_t PROTOCOL_VERSION = 3; // 3: Quant v2 (tokens, pools, state snapshots)
 constexpr size_t MAX_MESSAGE = 4 * 1024 * 1024;
 constexpr size_t FRAME_HEADER = 13;
 constexpr size_t MAX_HEADERS_PER_MSG = 2000;
+constexpr size_t SNAPSHOT_CHUNK = 1024 * 1024;
 
 enum class Cmd : uint8_t {
     Version = 1, Verack = 2, Ping = 3, Pong = 4, GetAddr = 5, Addr = 6,
     Inv = 7, GetData = 8, NotFound = 9, GetHeaders = 10, Headers = 11,
     BlockMsg = 12, TxMsg = 13, GetUtxos = 14, Utxos = 15, Reject = 16,
+    GetSnapshot = 17, Snapshot = 18, // fast sync: state snapshot download in chunks
 };
 const char* cmd_name(Cmd c);
 
-enum : uint64_t { SERVICE_FULL = 1, SERVICE_LIGHT_SERVE = 2, SERVICE_ARCHIVE = 4 };
+enum : uint64_t { SERVICE_FULL = 1, SERVICE_LIGHT_SERVE = 2, SERVICE_ARCHIVE = 4, SERVICE_SNAPSHOT = 8 };
 enum : uint8_t { INV_TX = 1, INV_BLOCK = 2 };
 
 struct VersionMsg {

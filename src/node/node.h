@@ -47,8 +47,7 @@ public:
     Wallet* wallet() { return wallet_.get(); }
 
     // Send from the wallet and broadcast. Returns txid.
-    std::string send(const std::vector<Wallet::Dest>& dests, Amount fee_per_kb, bool subtract_fee, const std::string& note,
-                     bool use_backup = false);
+    std::string send(const std::vector<Wallet::Dest>& dests, Amount fee_per_kb, bool subtract_fee, const std::string& note);
     // Broadcast a transaction already built + signed by the wallet (e.g. after a confirm dialog).
     std::string broadcast(const Transaction& tx, const std::string& note);
     bool start_mining(int threads, const std::string& address, std::string* err);
@@ -71,6 +70,13 @@ private:
     void wallet_refresh_coins();
     json block_json(const Block& b, const BlockIndex* idx, bool verbose);
     json tx_json(const Transaction& tx, const Hash256* block, int64_t height);
+    json out_json(const TxOut& o, const StateReader& st, int64_t n = -1);
+    json op_json(const TxOp& op, const StateReader& st);
+    json pool_json(const Pool& p, const StateReader& st);
+    json token_json(const TokenInfo& t, const StateReader& st);
+    int asset_decimals(const Hash256& a, const StateReader& st);
+    std::string asset_label(const Hash256& a, const StateReader& st);
+    Hash256 resolve_token(const std::string& s);
 
     NodeConfig cfg_;
     const ChainParams& p_;

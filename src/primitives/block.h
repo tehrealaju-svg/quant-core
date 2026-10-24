@@ -3,17 +3,18 @@
 
 namespace quant {
 
-// Fixed 120-byte header. Its plain BLAKE3 hash is both the block id and the proof of work.
+// Fixed 152-byte header. Its plain BLAKE3 hash is both the block id and the proof of work.
 struct BlockHeader {
-    uint32_t version = 1;
+    uint32_t version = 2;
     Hash256 prev;
     Hash256 merkle_root;   // over txids (core data)
     Hash256 witness_root;  // over per-tx witness hashes (prunable data)
+    Hash256 state_commit;  // at snapshot-commit heights: hash of the state snapshot (else zero)
     uint64_t time = 0;
     uint32_t bits = 0;
     uint64_t nonce = 0;
 
-    static constexpr size_t SIZE = 4 + 32 + 32 + 32 + 8 + 4 + 8;
+    static constexpr size_t SIZE = 4 + 32 + 32 + 32 + 32 + 8 + 4 + 8;
     void write(Writer& w) const;
     static BlockHeader read(Reader& r);
     void serialize(uint8_t out[SIZE]) const;

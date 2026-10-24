@@ -56,6 +56,7 @@ int main(int argc, char** argv) {
         else if (a == "-nodht") cfg.p2p.dht = false;
         else if (a == "-nolan") cfg.p2p.lan = false;
         else if (a == "-noupnp") cfg.p2p.upnp = false;
+        else if (a == "-nofastsync") cfg.p2p.fast_sync = false;
         else if (a == "-nolisten") cfg.p2p.listen = false;
         else if (a == "-noprune") cfg.prune = false;
         else if (!val("-mine").empty()) cfg.mine_threads = std::stoi(val("-mine"));
