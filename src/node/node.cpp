@@ -1,6 +1,7 @@
 #include "node/node.h"
 
 #include <filesystem>
+#include <set>
 
 #include "consensus/limits.h"
 #include "util/log.h"
@@ -48,6 +49,8 @@ bool Node::start(std::string* err) {
     cs_->on_disconnect.push_back([this](const Block& b, const BlockIndex* idx) {
         if (wallet_) wallet_->block_disconnected(b, idx->height);
     });
+    cs_->on_connect.push_back([this](const Block& b, const BlockIndex* idx) { pool_hist_connect(b, idx); });
+    cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) { pool_hist_disconnect(idx); });
     cs_->on_tip.push_back([this](const BlockIndex* t) {
         if (miner_) miner_->notify_new_tip();
         if (!wallet_) return;
@@ -65,7 +68,19 @@ bool Node::start(std::string* err) {
         if (mine) wallet_->tx_broadcast(tx, "");
     });
 
+    pool_hist_load();
     if (!cs_->load(err)) return false;
+    {
+        // Drop chart points above the loaded tip and compact the file.
+        std::lock_guard l(cs_->mu);
+        for (auto& [t, v] : pool_hist_)
+            while (!v.empty() && v.back().height > cs_->height()) v.pop_back();
+        if (f_poolhist_) fclose(f_poolhist_);
+        f_poolhist_ = fopen((dir_ + "/poolhist.dat").c_str(), "wb");
+        for (auto& [t, v] : pool_hist_)
+            for (auto& pt : v) { Writer w; w.hash(t); w.u64le(uint64_t(pt.height)); w.u64le(pt.time); w.u64le(pt.qnt); w.u64le(pt.tok); fwrite(w.buf.data(), 1, w.buf.size(), f_poolhist_); }
+        if (f_poolhist_) fflush(f_poolhist_);
+    }
     miner_ = std::make_unique<Miner>(*cs_, *mp_);
     miner_->on_found = [this](const Block& b) {
         std::string why;
@@ -97,6 +112,7 @@ void Node::stop() {
     if (p2p_) p2p_->stop();
     if (cs_) cs_->flush();
     if (wallet_) wallet_->save();
+    if (f_poolhist_) { fclose(f_poolhist_); f_poolhist_ = nullptr; }
 }
 
 // ---------------------------------------------------------------- wallet
@@ -201,4 +217,52 @@ bool Node::start_mining(int threads, const std::string& address, std::string* er
     return true;
 }
 
+} // namespace quant
+
+namespace quant {
+static constexpr size_t POOLHIST_REC = 32 + 8 * 4;
+
+static void pool_hist_put(std::vector<Node::PoolPoint>& v, const Node::PoolPoint& pt) {
+    while (!v.empty() && v.back().height >= pt.height) v.pop_back();
+    v.push_back(pt);
+}
+
+void Node::pool_hist_load() {
+    FILE* f = fopen((dir_ + "/poolhist.dat").c_str(), "rb");
+    if (!f) return;
+    uint8_t rec[POOLHIST_REC];
+    while (fread(rec, 1, sizeof rec, f) == sizeof rec) {
+        Reader r(rec, sizeof rec);
+        Hash256 t = r.hash();
+        PoolPoint pt;
+        pt.height = int64_t(r.u64le()); pt.time = r.u64le(); pt.qnt = r.u64le(); pt.tok = r.u64le();
+        pool_hist_put(pool_hist_[t], pt);
+    }
+    fclose(f);
+}
+
+void Node::pool_hist_connect(const Block& b, const BlockIndex* idx) {
+    std::set<Hash256> touched;
+    for (auto& tx : b.txs)
+        for (auto& op : tx.ops)
+            std::visit([&](auto& o) {
+                if constexpr (!std::is_same_v<std::decay_t<decltype(o)>, OpCreateToken>) touched.insert(o.token);
+            }, op);
+    for (auto& t : touched) {
+        auto pl = cs_->pool(t);
+        if (!pl) continue;
+        PoolPoint pt{idx->height, b.header.time, pl->qnt, pl->tok};
+        pool_hist_put(pool_hist_[t], pt);
+        if (f_poolhist_) {
+            Writer w; w.hash(t); w.u64le(uint64_t(pt.height)); w.u64le(pt.time); w.u64le(pt.qnt); w.u64le(pt.tok);
+            fwrite(w.buf.data(), 1, w.buf.size(), f_poolhist_);
+            fflush(f_poolhist_);
+        }
+    }
+}
+
+void Node::pool_hist_disconnect(const BlockIndex* idx) {
+    for (auto& [t, v] : pool_hist_)
+        while (!v.empty() && v.back().height >= idx->height) v.pop_back();
+}
 } // namespace quant

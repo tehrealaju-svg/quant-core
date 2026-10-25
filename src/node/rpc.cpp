@@ -58,6 +58,7 @@ const std::map<std::string, Cmd>& commands() {
         {"sendrawtransaction", {"hex", "Broadcast a signed transaction (full encoding, hex)"}},
         {"decoderawtransaction", {"hex", "Decode a transaction"}},
         {"getsnapshotinfo", {"", "State snapshots held and committed (fast sync)"}},
+        {"getpoolhistory", {"token [max_points=500]", "Pool reserves and price after each block that traded it (charts)"}},
         {"getemission", {"[height]", "Block reward, issued supply and the emission schedule"}},
         {"estimatefee", {"[inputs=1] [outputs=2]", "Fee for a typical transaction at the minimum rate"}},
         {"validateaddress", {"address", "Check an address"}},
@@ -673,6 +674,22 @@ json Node::rpc(const std::string& method, const json& params) {
         if (!mp_->accept(tx, &err)) throw RpcError("transaction rejected: " + err);
         if (p2p_) p2p_->broadcast_tx(tx);
         return tx.txid().hex();
+    }
+    if (method == "getpoolhistory") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        size_t maxp = size_t(std::clamp<int64_t>(arg_int(p, 1, 500), 1, 5000));
+        int d = asset_decimals(id, st);
+        json a = json::array();
+        auto it = pool_hist_.find(id);
+        if (it != pool_hist_.end()) {
+            auto& v = it->second;
+            for (size_t i = v.size() > maxp ? v.size() - maxp : 0; i < v.size(); i++) {
+                auto& pt = v[i];
+                double price = pt.tok ? (double(pt.qnt) / 1e10) / (double(pt.tok) / std::pow(10.0, d)) : 0;
+                a.push_back({{"height", pt.height}, {"time", pt.time}, {"price_qnt", price}, {"qnt_reserve", pt.qnt}, {"token_reserve", pt.tok}});
+            }
+        }
+        return a;
     }
     if (method == "getsnapshotinfo") {
         json j;

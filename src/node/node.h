@@ -32,6 +32,7 @@ std::string default_datadir();
 
 class Node {
 public:
+    struct PoolPoint { int64_t height; uint64_t time; Amount qnt, tok; };
     explicit Node(NodeConfig cfg);
     ~Node();
 
@@ -87,6 +88,12 @@ private:
     std::unique_ptr<Miner> miner_;
     std::unique_ptr<Wallet> wallet_;
     int64_t wallet_saved_height_ = 0;
+    // Pool reserves after every block that touched the pool (price charts). Persisted in poolhist.dat.
+    std::map<Hash256, std::vector<PoolPoint>> pool_hist_;
+    FILE* f_poolhist_ = nullptr;
+    void pool_hist_load();
+    void pool_hist_connect(const Block& b, const BlockIndex* idx);
+    void pool_hist_disconnect(const BlockIndex* idx);
     bool started_ = false;
     bool stop_requested_ = false;
 };

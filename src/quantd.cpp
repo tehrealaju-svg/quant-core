@@ -38,7 +38,7 @@ static void usage() {
 
 int main(int argc, char** argv) {
     NodeConfig cfg;
-    uint16_t rpcport = 0;
+    uint16_t rpcport = 0, publicport = 0;
     bool create_wallet = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -51,6 +51,7 @@ int main(int argc, char** argv) {
         else if (!val("-datadir").empty()) cfg.datadir = val("-datadir");
         else if (!val("-port").empty()) cfg.p2p.port = uint16_t(std::stoi(val("-port")));
         else if (!val("-rpcport").empty()) rpcport = uint16_t(std::stoi(val("-rpcport")));
+        else if (!val("-publicapi").empty()) publicport = uint16_t(std::stoi(val("-publicapi")));
         else if (!val("-addnode").empty()) cfg.p2p.addnodes.push_back(val("-addnode"));
         else if (!val("-connect").empty()) { cfg.p2p.addnodes.push_back(val("-connect")); cfg.p2p.connect_only = true; }
         else if (a == "-nodht") cfg.p2p.dht = false;
@@ -89,6 +90,11 @@ int main(int argc, char** argv) {
 
     HttpRpcServer rpc(node, rpcport ? rpcport : node.params().rpc_port);
     if (!rpc.start(&err)) logf("RPC disabled: %s", err.c_str());
+    std::unique_ptr<HttpRpcServer> pub;
+    if (publicport) {
+        pub = std::make_unique<HttpRpcServer>(node, publicport, true);
+        if (!pub->start(&err)) logf("public API disabled: %s", err.c_str());
+    }
 
     auto last = std::chrono::steady_clock::now();
     while (!g_stop && !node.stop_requested()) {
@@ -101,6 +107,7 @@ int main(int argc, char** argv) {
                  (long long)s.header_height, node.p2p() ? node.p2p()->peer_count() : 0, node.mempool().size(), node.miner().hashrate());
         }
     }
+    if (pub) pub->stop();
     rpc.stop();
     node.stop();
     return 0;

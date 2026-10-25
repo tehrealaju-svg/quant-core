@@ -10,7 +10,10 @@ namespace quant {
 
 class HttpRpcServer {
 public:
-    HttpRpcServer(Node& node, uint16_t port) : node_(node), port_(port) {}
+    // public = no cookie, CORS, read-only methods + sendrawtransaction (for websites / browser
+    // wallets, exposed through a tunnel). Still binds to localhost only.
+    HttpRpcServer(Node& node, uint16_t port, bool is_public = false) : node_(node), port_(port), public_(is_public) {}
+    static bool public_method(const std::string& m);
     ~HttpRpcServer() { stop(); }
     bool start(std::string* err);
     void stop();
@@ -21,6 +24,8 @@ private:
     void serve(sock_t c);
     Node& node_;
     uint16_t port_;
+    bool public_ = false;
+    std::atomic<int> active_{0};
     sock_t sock_ = BAD_SOCK;
     std::string token_;
     std::atomic<bool> running_{false};

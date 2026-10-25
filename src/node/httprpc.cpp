@@ -51,14 +51,25 @@ static void send_all(sock_t c, const std::string& s) {
     }
 }
 
+bool HttpRpcServer::public_method(const std::string& m) {
+    static const char* ok[] = {"getblockchaininfo", "getblockcount", "getbestblockhash", "getblockhash", "getblock",
+                               "gettransaction", "getaddressinfo", "getaddresscoins", "getmempoolinfo", "getrawmempool",
+                               "listtokens", "gettoken", "getpool", "quote", "sendrawtransaction", "decoderawtransaction",
+                               "getemission", "getpoolhistory", "estimatefee", "validateaddress", "getsnapshotinfo", "help"};
+    for (auto* s : ok) if (m == s) return true;
+    return false;
+}
+
 bool HttpRpcServer::start(std::string* err) {
-    token_ = random_hash().hex();
-    std::ofstream(cookie_path(node_.dir())) << token_;
+    if (!public_) {
+        token_ = random_hash().hex();
+        std::ofstream(cookie_path(node_.dir())) << token_;
+    }
     sock_ = tcp_listen(port_, false, err);
     if (sock_ == BAD_SOCK) return false;
     running_ = true;
     th_ = std::thread([this] { run(); });
-    logf("RPC listening on 127.0.0.1:%u", port_);
+    logf("%s listening on 127.0.0.1:%u", public_ ? "public API" : "RPC", port_);
     return true;
 }
 
@@ -67,7 +78,8 @@ void HttpRpcServer::stop() {
     running_ = false;
     if (th_.joinable()) th_.join();
     sock_close(sock_);
-    std::remove(cookie_path(node_.dir()).c_str());
+    while (active_ > 0) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!public_) std::remove(cookie_path(node_.dir()).c_str());
 }
 
 void HttpRpcServer::run() {
@@ -78,8 +90,9 @@ void HttpRpcServer::run() {
         if (sock_poll(&f, 1, 200) <= 0) continue;
         sock_t c = accept(sock_, nullptr, nullptr);
         if (c == BAD_SOCK) continue;
-        serve(c);
-        sock_close(c);
+        if (active_ >= 32) { sock_close(c); continue; }
+        active_++;
+        std::thread([this, c] { serve(c); sock_close(c); active_--; }).detach();
     }
 }
 
@@ -88,11 +101,15 @@ void HttpRpcServer::serve(sock_t c) {
     if (!recv_http(c, body, headers, 10000)) return;
     auto reply = [&](int code, const std::string& b) {
         std::string s = "HTTP/1.1 " + std::to_string(code) + (code == 200 ? " OK" : " Error") +
-                        "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + std::to_string(b.size()) +
+                        "\r\nContent-Type: application/json\r\nConnection: close\r\n" +
+                        std::string(public_ ? "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\n"
+                                              "Access-Control-Allow-Headers: Content-Type\r\n" : "") +
+                        "Content-Length: " + std::to_string(b.size()) +
                         "\r\n\r\n" + b;
         send_all(c, s);
     };
-    if (headers.find("Bearer " + token_) == std::string::npos) { reply(401, R"({"error":"unauthorized"})"); return; }
+    if (public_ && headers.rfind("OPTIONS", 0) == 0) { reply(200, "{}"); return; }
+    if (!public_ && headers.find("Bearer " + token_) == std::string::npos) { reply(401, R"({"error":"unauthorized"})"); return; }
     json req, resp;
     try {
         req = json::parse(body);
@@ -102,6 +119,8 @@ void HttpRpcServer::serve(sock_t c) {
     }
     resp["id"] = req.value("id", json(nullptr));
     try {
+        std::string m = req.value("method", "");
+        if (public_ && !public_method(m)) throw std::runtime_error("method not available on the public API");
         resp["result"] = node_.rpc(req.value("method", ""), req.value("params", json::array()));
         resp["error"] = nullptr;
     } catch (const std::exception& e) {
