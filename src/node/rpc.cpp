@@ -703,6 +703,9 @@ json Node::rpc(const std::string& method, const json& params) {
         int64_t now = now_seconds();
         if (auto it = last.find(a); it != last.end() && now - it->second < 86400) throw RpcError("this address already got coins today");
         Amount amt = (1 + Amount(now % 10)) * COIN;
+        Amount have = need_wallet().balance(cs_->height()).spendable(), keep = COIN / 100; // leave room for the fee
+        if (have < COIN / 2 + keep) throw RpcError("insufficient QNT: the faucet is refilling");
+        amt = std::min(amt, have - keep);
         std::string id = send({{addr, amt, QNT_ASSET}}, 0, false, "faucet");
         last[a] = now;
         return json{{"txid", id}, {"amount", format_amount(amt)}};
