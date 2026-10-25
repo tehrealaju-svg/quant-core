@@ -17,6 +17,11 @@ struct Cmd {
     const char* help;
 };
 
+static const char* gift_name(uint8_t g) {
+    static const char* n[] = {"none", "rose", "pizza", "diamond", "rocket"};
+    return g < GIFT_COUNT ? n[g] : "none";
+}
+
 const std::map<std::string, Cmd>& commands() {
     static const std::map<std::string, Cmd> m = {
         {"help", {"[command]", "List commands or show help for one"}},
@@ -62,6 +67,9 @@ const std::map<std::string, Cmd>& commands() {
         {"getpoolhistory", {"token [max_points=500]", "Pool reserves and price after each block that traded it (charts)"}},
         {"listmarkets", {"[sort=movers|new|mcap|oldest|lasttrade] [count=100]", "Coins with price, market cap, ATH, age, trades, volume, traders, 1h/6h/24h change and a sparkline"}},
         {"getpooltrades", {"token [count=100]", "Recent trades on a coin's pool (newest first)"}},
+        {"listgifts", {"", "Gifts you can attach to a message, with their QNT price (paid to the recipient)"}},
+        {"sendmessage", {"address \"text\" [gift=none|rose|pizza|diamond|rocket]", "Send an on-chain message (public), optionally with a gift"}},
+        {"getmessages", {"address [count=200]", "Messages to and from an address, newest first (pending included)"}},
         {"setban", {"ip 24h|7d|31d|forever [reason]", "Ban an IP from connecting"}},
         {"clearban", {"ip", "Remove a ban"}},
         {"listbanned", {"", "Banned IPs and when each ban ends"}},
@@ -181,6 +189,9 @@ json Node::op_json(const TxOp& op, const StateReader& st) {
         if constexpr (std::is_same_v<T, OpCreateToken>) {
             return {{"type", "create-token"}, {"ticker", o.ticker}, {"name", o.name}, {"decimals", o.decimals},
                     {"supply", format_units(o.supply, o.decimals)}, {"uri", o.uri}};
+        } else if constexpr (std::is_same_v<T, OpMessage>) {
+            return {{"type", "message"}, {"from", encode_address(p_, 0, o.from)}, {"to", encode_address(p_, 0, o.to)},
+                    {"gift", o.gift}, {"gift_price", format_amount(GIFT_PRICE[o.gift < GIFT_COUNT ? o.gift : 0])}, {"text", o.text}};
         } else {
             int d = asset_decimals(o.token, st);
             std::string tk = asset_label(o.token, st);
@@ -681,6 +692,41 @@ json Node::rpc(const std::string& method, const json& params) {
         if (!mp_->accept(tx, &err)) throw RpcError("transaction rejected: " + err);
         if (p2p_) p2p_->broadcast_tx(tx);
         return tx.txid().hex();
+    }
+    if (method == "listgifts") {
+        json a = json::array();
+        for (uint8_t g = 1; g < GIFT_COUNT; g++) a.push_back({{"id", g}, {"name", gift_name(g)}, {"price", format_amount(GIFT_PRICE[g])}});
+        return a;
+    }
+    if (method == "sendmessage") {
+        uint8_t v; Hash256 to;
+        if (!decode_address(p_, arg_str(p, 0), v, to)) throw RpcError("invalid address");
+        std::string g = arg_str(p, 2, "0");
+        int gift = -1;
+        for (uint8_t i = 0; i < GIFT_COUNT; i++) if (g == gift_name(i) || g == std::to_string(i)) gift = i;
+        if (gift < 0) throw RpcError("unknown gift (rose, pizza, diamond, rocket)");
+        Transaction tx; Amount fee; std::string err;
+        if (!need_wallet().send_message(to, arg_str(p, 1), uint8_t(gift), fee_kb, tip(), tx, &fee, &err)) throw RpcError(err);
+        return broadcast_built(tx, gift ? std::string("gift ") + gift_name(uint8_t(gift)) : "message", fee,
+                               json{{"gift", gift_name(uint8_t(gift))}, {"paid", format_amount(std::max(DUST_LIMIT, GIFT_PRICE[gift]))}});
+    }
+    if (method == "getmessages") {
+        uint8_t v; Hash256 a;
+        if (!decode_address(p_, arg_str(p, 0), v, a)) throw RpcError("invalid address");
+        size_t n = size_t(std::clamp<int64_t>(arg_int(p, 1, 200), 1, 2000));
+        auto mj = [&](const MsgPoint& m) {
+            return json{{"height", m.height}, {"time", m.time}, {"txid", m.txid.hex()}, {"from", encode_address(p_, 0, m.from)},
+                        {"to", encode_address(p_, 0, m.to)}, {"gift", m.gift}, {"gift_name", gift_name(m.gift)},
+                        {"gift_price", format_amount(GIFT_PRICE[m.gift])}, {"text", m.text}, {"pending", m.height < 0}};
+        };
+        json out = json::array();
+        for (auto* e : mp_->all())
+            for (auto& op : e->tx.ops)
+                if (auto* m = std::get_if<OpMessage>(&op); m && (m->from == a || m->to == a))
+                    out.push_back(mj(MsgPoint{-1, e->time, e->txid, m->from, m->to, m->gift, m->text}));
+        for (auto it = msgs_.rbegin(); it != msgs_.rend() && out.size() < n; ++it)
+            if (it->from == a || it->to == a) out.push_back(mj(*it));
+        return out;
     }
     if (method == "getpooltrades") {
         Hash256 id = resolve_token(arg_str(p, 0));

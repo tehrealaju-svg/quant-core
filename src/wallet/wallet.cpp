@@ -404,7 +404,8 @@ void Wallet::process_tx(const Transaction& tx, int64_t height, int64_t time) {
     // Fee = QNT that went in (inputs + released by ops) minus QNT that came out (outputs + absorbed).
     int64_t op_q = 0;
     for (auto& op : tx.ops) {
-        if (std::holds_alternative<OpCreateToken>(op)) t.kind = "token-create";
+        if (auto* m = std::get_if<OpMessage>(&op)) { if (t.kind.empty() || t.kind == "send" || t.kind == "receive") t.kind = m->gift ? "gift" : "message"; }
+        else if (std::holds_alternative<OpCreateToken>(op)) t.kind = "token-create";
         else if (auto* s = std::get_if<OpSwap>(&op)) { t.kind = "swap"; op_q += s->sell ? int64_t(s->out) : -int64_t(s->in); }
         else if (auto* p = std::get_if<OpPoolCreate>(&op)) { t.kind = "liquidity"; op_q -= int64_t(p->qnt); }
         else if (auto* a = std::get_if<OpAddLiquidity>(&op)) { t.kind = "liquidity"; op_q -= int64_t(a->qnt); }
@@ -624,6 +625,24 @@ bool Wallet::create_token(const OpCreateToken& t, Amount fee_per_kb, int64_t tip
     if (!build(std::move(plan), tip, fee_per_kb, out, fee_out, err)) return false;
     if (token_out) *token_out = id;
     return true;
+}
+
+bool Wallet::send_message(const Hash256& to, const std::string& text, uint8_t gift, Amount fee_per_kb, int64_t tip,
+                          Transaction& out, Amount* fee_out, std::string* err) {
+    std::lock_guard l(mu);
+    if (gift >= GIFT_COUNT) { if (err) *err = "unknown gift"; return false; }
+    if (text.size() > MAX_MESSAGE_TEXT) { if (err) *err = "message is longer than 280 bytes"; return false; }
+    if (text.empty() && !gift) { if (err) *err = "empty message"; return false; }
+    for (unsigned char c : text) if (c < 0x20 || c == 0x7f) { if (err) *err = "message has control characters"; return false; }
+    Plan plan;
+    plan.outs.push_back(TxOut{std::max(DUST_LIMIT, GIFT_PRICE[gift]), QNT_ASSET, to});
+    plan.ops.push_back(OpMessage{Hash256{}, to, gift, text});
+    plan.extra_outs = (text.size() + 73) / 74 + 1; // the text is longer than the 160 bytes estimated per op
+    plan.finish = [this](Transaction& tx) {
+        auto it = coins_.find(tx.ins[0].prev);
+        if (it != coins_.end()) std::get<OpMessage>(tx.ops[0]).from = it->second.out.addr;
+    };
+    return build(std::move(plan), tip, fee_per_kb, out, fee_out, err);
 }
 
 bool Wallet::swap(const Hash256& token, bool sell, Amount in, Amount min_out, Amount fee_per_kb, int64_t tip,

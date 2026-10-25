@@ -38,7 +38,7 @@ struct TxOut {
 };
 
 // ---- token ops
-enum class OpType : uint8_t { CreateToken = 1, PoolCreate = 2, AddLiquidity = 3, RemoveLiquidity = 4, Swap = 5 };
+enum class OpType : uint8_t { CreateToken = 1, PoolCreate = 2, AddLiquidity = 3, RemoveLiquidity = 4, Swap = 5, Message = 6 };
 
 struct OpCreateToken {          // mints `supply` of a brand-new token into this tx's outputs
     std::string ticker;         // 1-10 chars A-Z 0-9
@@ -68,7 +68,13 @@ struct OpSwap {
     Amount in = 0;
     Amount out = 0;             // <= constant-product quote after the 0.3% pool fee
 };
-using TxOp = std::variant<OpCreateToken, OpPoolCreate, OpAddLiquidity, OpRemoveLiquidity, OpSwap>;
+struct OpMessage {            // on-chain chat line, optionally with a paid gift (see GIFT_PRICE)
+    Hash256 from;               // must be the address of one of the tx inputs
+    Hash256 to;                 // the tx must pay this address at least max(dust, gift price) QNT
+    uint8_t gift = 0;           // 0 = none
+    std::string text;           // UTF-8, <= MAX_MESSAGE_TEXT bytes (public: anyone can read it)
+};
+using TxOp = std::variant<OpCreateToken, OpPoolCreate, OpAddLiquidity, OpRemoveLiquidity, OpSwap, OpMessage>;
 
 // ---- witness (per input)
 enum class WitnessType : uint8_t { Ref = 0, Falcon = 1 };

@@ -53,6 +53,10 @@ bool Node::start(std::string* err) {
     cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) { pool_hist_disconnect(idx); });
     cs_->on_connect.push_back([this](const Block& b, const BlockIndex* idx) { trades_connect(b, idx); });
     cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) { trades_disconnect(idx); });
+    cs_->on_connect.push_back([this](const Block& b, const BlockIndex* idx) { msgs_connect(b, idx); });
+    cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) {
+        while (!msgs_.empty() && msgs_.back().height >= idx->height) msgs_.pop_back();
+    });
     cs_->on_tip.push_back([this](const BlockIndex* t) {
         if (miner_) miner_->notify_new_tip();
         if (!wallet_) return;
@@ -76,6 +80,7 @@ bool Node::start(std::string* err) {
 
     pool_hist_load();
     trades_load();
+    msgs_load();
     if (!cs_->load(err)) return false;
     {
         // Drop chart points above the loaded tip and compact the file.
@@ -88,6 +93,7 @@ bool Node::start(std::string* err) {
             for (auto& pt : v) { Writer w; w.hash(t); w.u64le(uint64_t(pt.height)); w.u64le(pt.time); w.u64le(pt.qnt); w.u64le(pt.tok); fwrite(w.buf.data(), 1, w.buf.size(), f_poolhist_); }
         if (f_poolhist_) fflush(f_poolhist_);
         trades_compact();
+        msgs_compact();
     }
     miner_ = std::make_unique<Miner>(*cs_, *mp_);
     miner_->on_found = [this](const Block& b) {
@@ -122,6 +128,7 @@ void Node::stop() {
     if (wallet_) wallet_->save();
     if (f_poolhist_) { fclose(f_poolhist_); f_poolhist_ = nullptr; }
     if (f_trades_) { fclose(f_trades_); f_trades_ = nullptr; }
+    if (f_msgs_) { fclose(f_msgs_); f_msgs_ = nullptr; }
 }
 
 // ---------------------------------------------------------------- wallet
@@ -255,7 +262,8 @@ void Node::pool_hist_connect(const Block& b, const BlockIndex* idx) {
     for (auto& tx : b.txs)
         for (auto& op : tx.ops)
             std::visit([&](auto& o) {
-                if constexpr (!std::is_same_v<std::decay_t<decltype(o)>, OpCreateToken>) touched.insert(o.token);
+                using T = std::decay_t<decltype(o)>;
+                if constexpr (!std::is_same_v<T, OpCreateToken> && !std::is_same_v<T, OpMessage>) touched.insert(o.token);
             }, op);
     for (auto& t : touched) {
         auto pl = cs_->pool(t);
@@ -342,5 +350,61 @@ void Node::trades_connect(const Block& b, const BlockIndex* idx) {
 void Node::trades_disconnect(const BlockIndex* idx) {
     for (auto& [t, v] : trades_)
         while (!v.empty() && v.back().height >= idx->height) v.pop_back();
+}
+} // namespace quant
+
+namespace quant {
+// ---------------------------------------------------------------- message index (OpMessage, chat + gifts)
+static void write_msg(FILE* f, const Node::MsgPoint& m) {
+    if (!f) return;
+    Writer w;
+    w.u64le(uint64_t(m.height)); w.u64le(m.time); w.hash(m.txid); w.hash(m.from); w.hash(m.to); w.u8(m.gift); w.str(m.text);
+    Writer len; len.u32le(uint32_t(w.buf.size()));
+    fwrite(len.buf.data(), 1, len.buf.size(), f);
+    fwrite(w.buf.data(), 1, w.buf.size(), f);
+}
+
+void Node::msgs_load() {
+    FILE* f = fopen((dir_ + "/messages.dat").c_str(), "rb");
+    if (!f) return;
+    uint8_t lb[4];
+    while (fread(lb, 1, 4, f) == 4) {
+        uint32_t n = uint32_t(lb[0]) | uint32_t(lb[1]) << 8 | uint32_t(lb[2]) << 16 | uint32_t(lb[3]) << 24;
+        if (n > 1024) break;
+        Bytes rec(n);
+        if (fread(rec.data(), 1, n, f) != n) break;
+        try {
+            Reader r(rec.data(), rec.size());
+            MsgPoint m;
+            m.height = int64_t(r.u64le()); m.time = r.u64le(); m.txid = r.hash(); m.from = r.hash(); m.to = r.hash();
+            m.gift = r.u8(); m.text = r.str(MAX_MESSAGE_TEXT);
+            if (m.gift >= GIFT_COUNT) continue;
+            while (!msgs_.empty() && msgs_.back().height > m.height) msgs_.pop_back(); // reorged away
+            bool dup = false;
+            for (auto it = msgs_.rbegin(); it != msgs_.rend() && it->height == m.height; ++it) dup |= it->txid == m.txid;
+            if (!dup) msgs_.push_back(std::move(m));
+        } catch (const std::exception&) { break; }
+    }
+    fclose(f);
+}
+
+void Node::msgs_compact() {
+    while (!msgs_.empty() && msgs_.back().height > cs_->height()) msgs_.pop_back();
+    if (f_msgs_) fclose(f_msgs_);
+    f_msgs_ = fopen((dir_ + "/messages.dat").c_str(), "wb");
+    for (auto& m : msgs_) write_msg(f_msgs_, m);
+    if (f_msgs_) fflush(f_msgs_);
+}
+
+void Node::msgs_connect(const Block& b, const BlockIndex* idx) {
+    while (!msgs_.empty() && msgs_.back().height >= idx->height) msgs_.pop_back();
+    for (auto& tx : b.txs)
+        for (auto& op : tx.ops)
+            if (auto* m = std::get_if<OpMessage>(&op)) {
+                MsgPoint p{idx->height, b.header.time, tx.txid(), m->from, m->to, m->gift, m->text};
+                write_msg(f_msgs_, p);
+                msgs_.push_back(std::move(p));
+            }
+    if (f_msgs_) fflush(f_msgs_);
 }
 } // namespace quant

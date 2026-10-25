@@ -249,3 +249,41 @@ TEST(p2p_snapshot_sync) {
     std::filesystem::remove_all(ca.datadir, ec);
     std::filesystem::remove_all(cb.datadir, ec);
 }
+
+TEST(messages_and_gifts) {
+    // A message must pay its recipient the gift price and be sent from one of the tx's inputs.
+    auto& p = params_for(Network::Regtest);
+    std::string dir = temp_dir("msgs");
+    Chainstate cs(p, dir);
+    std::string err;
+    CHECK(cs.load(&err));
+    Mempool mp(cs);
+    auto w = Wallet::create(dir + "/w.qwl", p, mnemonic_generate(), "", "", 0, &err);
+    cs.on_connect.push_back([&](const Block& b, const BlockIndex* i) { w->block_connected(b, i->height); });
+    Hash256 payout = w->issued_keys().front()->addr;
+    for (int i = 0; i < COINBASE_MATURITY + 2; i++) CHECK(cs.accept_block(mine_on(cs, mp, payout), true, &err));
+    Hash256 friend_addr = blake3((const uint8_t*)"friend", 6);
+
+    Transaction tx; Amount fee;
+    CHECK(w->send_message(friend_addr, "gm \xF0\x9F\x8C\xB9 here's a rose", 1, 0, cs.height(), tx, &fee, &err));
+    auto& m = std::get<OpMessage>(tx.ops[0]);
+    CHECK(w->is_mine(m.from) && m.to == friend_addr && m.gift == 1);
+    Bytes raw = tx.full_bytes();
+    Reader rd(raw);
+    CHECK(Transaction::read_full(rd).txid() == tx.txid());
+
+    // Underpaying the gift, or claiming someone else's "from", is rejected.
+    Transaction bad = tx;
+    std::get<OpMessage>(bad.ops[0]).gift = 4; // rocket costs 25 QNT, only 0.1 paid
+    CHECK(!check_tx_basic(bad, true).ok);
+    Transaction spoof = tx;
+    std::get<OpMessage>(spoof.ops[0]).from = friend_addr;
+    CHECK(!mp.accept(spoof, &err));
+    std::string long_text(MAX_MESSAGE_TEXT + 1, 'a');
+    CHECK(!w->send_message(friend_addr, long_text, 0, 0, cs.height(), bad, &fee, &err));
+    CHECK(mp.accept(tx, &err));
+
+    CHECK(cs.accept_block(mine_on(cs, mp, payout), true, &err));
+    CHECK(mp.all().empty());
+    { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+}

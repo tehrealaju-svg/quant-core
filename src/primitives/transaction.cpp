@@ -36,6 +36,8 @@ static void write_op(Writer& w, const TxOp& op) {
             w.u8(uint8_t(OpType::RemoveLiquidity)); w.hash(o.token); w.varint(o.shares); w.varint(o.qnt); w.varint(o.tok);
         } else if constexpr (std::is_same_v<T, OpSwap>) {
             w.u8(uint8_t(OpType::Swap)); w.hash(o.token); w.u8(o.sell ? 1 : 0); w.varint(o.in); w.varint(o.out);
+        } else if constexpr (std::is_same_v<T, OpMessage>) {
+            w.u8(uint8_t(OpType::Message)); w.hash(o.from); w.hash(o.to); w.u8(o.gift); w.str(o.text);
         }
     }, op);
 }
@@ -56,6 +58,7 @@ static TxOp read_op(Reader& r) {
         o.sell = s == 1; o.in = r.varint(); o.out = r.varint();
         return o;
     }
+    case OpType::Message: { OpMessage o; o.from = r.hash(); o.to = r.hash(); o.gift = r.u8(); o.text = r.str(MAX_MESSAGE_TEXT); return o; }
     }
     throw SerializeError("unknown op");
 }

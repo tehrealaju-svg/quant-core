@@ -107,6 +107,7 @@ TxResult check_tx_basic(const Transaction& tx, bool expect_witness) {
             if (o.value > MAX_TOKEN_SUPPLY) return TxResult::fail("output-too-large");
         }
     }
+    int messages = 0;
     for (auto& op : tx.ops) {
         if (auto* c = std::get_if<OpCreateToken>(&op)) {
             if (!valid_ticker(c->ticker)) return TxResult::fail("bad-ticker");
@@ -122,6 +123,15 @@ TxResult check_tx_basic(const Transaction& tx, bool expect_witness) {
             if (r->token.is_zero() || !r->shares || (!r->qnt && !r->tok)) return TxResult::fail("bad-remove-liquidity");
         } else if (auto* s = std::get_if<OpSwap>(&op)) {
             if (s->token.is_zero() || !s->in || !s->out) return TxResult::fail("bad-swap");
+        } else if (auto* m = std::get_if<OpMessage>(&op)) {
+            if (++messages > 1) return TxResult::fail("too-many-messages");
+            if (m->gift >= GIFT_COUNT) return TxResult::fail("bad-gift");
+            if (m->text.size() > MAX_MESSAGE_TEXT) return TxResult::fail("message-too-long");
+            for (unsigned char ch : m->text) if (ch < 0x20 || ch == 0x7f) return TxResult::fail("bad-message-text");
+            if (m->text.empty() && !m->gift) return TxResult::fail("empty-message");
+            Amount need = std::max(DUST_LIMIT, GIFT_PRICE[m->gift]), paid = 0;
+            for (auto& o : tx.outs) if (o.is_qnt() && o.addr == m->to) paid += o.value;
+            if (paid < need) return TxResult::fail("message-underpaid");
         }
     }
     return {};
@@ -245,6 +255,10 @@ TxResult LedgerView::apply(const Transaction& tx, uint64_t height, const Hash256
             Hash256 in_asset = s->sell ? s->token : QNT_ASSET, out_asset = s->sell ? QNT_ASSET : s->token;
             minus[in_asset] += s->in;
             plus[out_asset] += s->out;
+        } else if (auto* m = std::get_if<OpMessage>(&op)) {
+            bool from_input = false;
+            for (auto& c : coins) from_input |= c.out.addr == m->from;
+            if (!from_input) return TxResult::fail("message-from-not-input");
         }
     }
 

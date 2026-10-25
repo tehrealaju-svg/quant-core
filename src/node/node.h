@@ -34,6 +34,7 @@ class Node {
 public:
     struct PoolPoint { int64_t height; uint64_t time; Amount qnt, tok; };
     struct TradePoint { int64_t height; uint64_t time; Hash256 txid; bool sell; Amount in, out; Hash256 trader; };
+    struct MsgPoint { int64_t height; uint64_t time; Hash256 txid, from, to; uint8_t gift; std::string text; };
     explicit Node(NodeConfig cfg);
     ~Node();
 
@@ -94,6 +95,11 @@ private:
     std::map<Hash256, std::vector<PoolPoint>> pool_hist_;
     std::map<Hash256, std::vector<TradePoint>> trades_; // swaps per token, oldest first (trades.dat)
     FILE* f_trades_ = nullptr;
+    std::vector<MsgPoint> msgs_;   // every on-chain message, oldest first (messages.dat)
+    FILE* f_msgs_ = nullptr;
+    void msgs_load();
+    void msgs_compact();
+    void msgs_connect(const Block& b, const BlockIndex* idx);
     FILE* f_poolhist_ = nullptr;
     void pool_hist_load();
     void pool_hist_connect(const Block& b, const BlockIndex* idx);

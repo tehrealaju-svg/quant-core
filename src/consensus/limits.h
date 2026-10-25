@@ -33,6 +33,11 @@ constexpr Amount MAX_TOKEN_SUPPLY = 10'000'000'000'000'000'000ULL; // 1e19 base 
 constexpr Amount MIN_LIQUIDITY = 1000;            // pool shares locked forever at pool creation
 constexpr uint64_t POOL_FEE_BPS = 30;             // 0.3% of each swap stays in the pool (all to liquidity providers)
 
+// ---- messages / gifts (OpMessage). Gift ids index GIFT_PRICE; the price is paid to the recipient.
+constexpr size_t MAX_MESSAGE_TEXT = 280;          // bytes of UTF-8
+constexpr Amount GIFT_PRICE[] = {0, COIN / 10, COIN / 2, 5 * COIN, 25 * COIN}; // none, rose, pizza, diamond, rocket
+constexpr uint8_t GIFT_COUNT = sizeof(GIFT_PRICE) / sizeof(GIFT_PRICE[0]);
+
 // ---- timing / difficulty
 constexpr int64_t TARGET_SPACING = 120;           // seconds
 constexpr int LWMA_WINDOW = 60;                   // blocks (2 hours)

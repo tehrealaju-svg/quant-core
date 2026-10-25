@@ -108,6 +108,9 @@ public:
                       Amount* fee_out, std::string* err);
     // Swap exactly `in`; receive at least `min_out` (the tx asks for exactly min_out; any better
     // price stays in the pool). sell=false: QNT -> token, true: token -> QNT.
+    // On-chain message to `to`, paying it the gift price (or dust when there is no gift).
+    bool send_message(const Hash256& to, const std::string& text, uint8_t gift, Amount fee_per_kb, int64_t tip,
+                      Transaction& out, Amount* fee_out, std::string* err);
     bool swap(const Hash256& token, bool sell, Amount in, Amount min_out, Amount fee_per_kb, int64_t tip,
               Transaction& out, Amount* fee_out, std::string* err);
     // Deposit QNT + token (creates the pool if `pool` is nullopt). Shares go to this wallet.
