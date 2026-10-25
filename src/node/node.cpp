@@ -51,13 +51,19 @@ bool Node::start(std::string* err) {
     });
     cs_->on_connect.push_back([this](const Block& b, const BlockIndex* idx) { pool_hist_connect(b, idx); });
     cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) { pool_hist_disconnect(idx); });
+    cs_->on_connect.push_back([this](const Block& b, const BlockIndex* idx) { trades_connect(b, idx); });
+    cs_->on_disconnect.push_back([this](const Block&, const BlockIndex* idx) { trades_disconnect(idx); });
     cs_->on_tip.push_back([this](const BlockIndex* t) {
         if (miner_) miner_->notify_new_tip();
         if (!wallet_) return;
+        // Coins are rebuilt on every new tip, but the encrypted file (slow key stretching) is
+        // written at most once a minute; it is also saved on shutdown and after every send.
         wallet_refresh_coins();
-        if (t->height - wallet_saved_height_ >= 10 || !cs_->is_initial_sync()) {
+        int64_t now = now_seconds();
+        if (now - wallet_saved_time_ >= 60) {
             wallet_->save();
             wallet_saved_height_ = t->height;
+            wallet_saved_time_ = now;
         }
     });
     mp_->on_added.push_back([this](const Transaction& tx) {
@@ -69,6 +75,7 @@ bool Node::start(std::string* err) {
     });
 
     pool_hist_load();
+    trades_load();
     if (!cs_->load(err)) return false;
     {
         // Drop chart points above the loaded tip and compact the file.
@@ -80,6 +87,7 @@ bool Node::start(std::string* err) {
         for (auto& [t, v] : pool_hist_)
             for (auto& pt : v) { Writer w; w.hash(t); w.u64le(uint64_t(pt.height)); w.u64le(pt.time); w.u64le(pt.qnt); w.u64le(pt.tok); fwrite(w.buf.data(), 1, w.buf.size(), f_poolhist_); }
         if (f_poolhist_) fflush(f_poolhist_);
+        trades_compact();
     }
     miner_ = std::make_unique<Miner>(*cs_, *mp_);
     miner_->on_found = [this](const Block& b) {
@@ -113,6 +121,7 @@ void Node::stop() {
     if (cs_) cs_->flush();
     if (wallet_) wallet_->save();
     if (f_poolhist_) { fclose(f_poolhist_); f_poolhist_ = nullptr; }
+    if (f_trades_) { fclose(f_trades_); f_trades_ = nullptr; }
 }
 
 // ---------------------------------------------------------------- wallet
@@ -263,6 +272,75 @@ void Node::pool_hist_connect(const Block& b, const BlockIndex* idx) {
 
 void Node::pool_hist_disconnect(const BlockIndex* idx) {
     for (auto& [t, v] : pool_hist_)
+        while (!v.empty() && v.back().height >= idx->height) v.pop_back();
+}
+} // namespace quant
+
+namespace quant {
+// ---------------------------------------------------------------- trade index (swaps per token)
+static constexpr size_t TRADE_REC = 32 + 8 + 8 + 32 + 1 + 8 + 8 + 32;
+
+static void write_trade(FILE* f, const Hash256& token, const Node::TradePoint& t) {
+    if (!f) return;
+    Writer w;
+    w.hash(token); w.u64le(uint64_t(t.height)); w.u64le(t.time); w.hash(t.txid); w.u8(t.sell);
+    w.u64le(t.in); w.u64le(t.out); w.hash(t.trader);
+    fwrite(w.buf.data(), 1, w.buf.size(), f);
+}
+
+void Node::trades_load() {
+    FILE* f = fopen((dir_ + "/trades.dat").c_str(), "rb");
+    if (!f) return;
+    uint8_t rec[TRADE_REC];
+    while (fread(rec, 1, sizeof rec, f) == sizeof rec) {
+        Reader r(rec, sizeof rec);
+        Hash256 tok = r.hash();
+        TradePoint t;
+        t.height = int64_t(r.u64le()); t.time = r.u64le(); t.txid = r.hash(); t.sell = r.u8() != 0;
+        t.in = r.u64le(); t.out = r.u64le(); t.trader = r.hash();
+        auto& v = trades_[tok];
+        while (!v.empty() && v.back().height > t.height) v.pop_back(); // reorged away
+        bool dup = false;
+        for (auto it = v.rbegin(); it != v.rend() && it->height == t.height; ++it)
+            if (it->txid == t.txid && it->in == t.in && it->out == t.out) { dup = true; break; }
+        if (!dup) v.push_back(t);
+    }
+    fclose(f);
+}
+
+void Node::trades_compact() {
+    for (auto& [t, v] : trades_)
+        while (!v.empty() && v.back().height > cs_->height()) v.pop_back();
+    if (f_trades_) fclose(f_trades_);
+    f_trades_ = fopen((dir_ + "/trades.dat").c_str(), "wb");
+    for (auto& [tok, v] : trades_) for (auto& t : v) write_trade(f_trades_, tok, t);
+    if (f_trades_) fflush(f_trades_);
+}
+
+void Node::trades_connect(const Block& b, const BlockIndex* idx) {
+    bool trimmed_any = false;
+    std::set<Hash256> trimmed;
+    for (auto& tx : b.txs) {
+        Hash256 id;
+        bool have_id = false;
+        for (auto& op : tx.ops) {
+            auto* s = std::get_if<OpSwap>(&op);
+            if (!s) continue;
+            if (!have_id) { id = tx.txid(); have_id = true; }
+            auto& v = trades_[s->token];
+            if (trimmed.insert(s->token).second)
+                while (!v.empty() && v.back().height >= idx->height) { v.pop_back(); trimmed_any = true; }
+            TradePoint t{idx->height, b.header.time, id, s->sell, s->in, s->out, tx.outs.empty() ? Hash256{} : tx.outs[0].addr};
+            v.push_back(t);
+            write_trade(f_trades_, s->token, t);
+        }
+    }
+    if (f_trades_) fflush(f_trades_);
+    (void)trimmed_any;
+}
+
+void Node::trades_disconnect(const BlockIndex* idx) {
+    for (auto& [t, v] : trades_)
         while (!v.empty() && v.back().height >= idx->height) v.pop_back();
 }
 } // namespace quant

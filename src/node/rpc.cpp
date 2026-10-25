@@ -1,6 +1,7 @@
 // RPC / console commands. Shared by quantd's HTTP server, quant-cli and the desktop console.
 #include <algorithm>
 #include <map>
+#include <set>
 
 #include "consensus/limits.h"
 #include "node/node.h"
@@ -59,6 +60,11 @@ const std::map<std::string, Cmd>& commands() {
         {"decoderawtransaction", {"hex", "Decode a transaction"}},
         {"getsnapshotinfo", {"", "State snapshots held and committed (fast sync)"}},
         {"getpoolhistory", {"token [max_points=500]", "Pool reserves and price after each block that traded it (charts)"}},
+        {"listmarkets", {"[sort=movers|new|mcap|oldest|lasttrade] [count=100]", "Coins with price, market cap, ATH, age, trades, volume, traders, 1h/6h/24h change and a sparkline"}},
+        {"getpooltrades", {"token [count=100]", "Recent trades on a coin's pool (newest first)"}},
+        {"setban", {"ip 24h|7d|31d|forever [reason]", "Ban an IP from connecting"}},
+        {"clearban", {"ip", "Remove a ban"}},
+        {"listbanned", {"", "Banned IPs and when each ban ends"}},
         {"getemission", {"[height]", "Block reward, issued supply and the emission schedule"}},
         {"estimatefee", {"[inputs=1] [outputs=2]", "Fee for a typical transaction at the minimum rate"}},
         {"validateaddress", {"address", "Check an address"}},
@@ -378,7 +384,8 @@ json Node::rpc(const std::string& method, const json& params) {
         if (p2p_) for (auto& pi : p2p_->peers())
             a.push_back({{"id", pi.id}, {"addr", pi.addr}, {"inbound", pi.inbound}, {"light_wallet", pi.light}, {"agent", pi.agent},
                          {"height", pi.height}, {"connected_secs", pi.connected_secs}, {"ping_ms", pi.ping_ms},
-                         {"bytes_in", pi.bytes_in}, {"bytes_out", pi.bytes_out}, {"downloading", pi.inflight}});
+                         {"bytes_in", pi.bytes_in}, {"bytes_out", pi.bytes_out}, {"downloading", pi.inflight},
+                         {"blocks_sent", pi.blocks_sent}, {"syncing_from_us", pi.syncing_from_us}});
         return a;
     }
     if (method == "getnetworkinfo") {
@@ -674,6 +681,109 @@ json Node::rpc(const std::string& method, const json& params) {
         if (!mp_->accept(tx, &err)) throw RpcError("transaction rejected: " + err);
         if (p2p_) p2p_->broadcast_tx(tx);
         return tx.txid().hex();
+    }
+    if (method == "getpooltrades") {
+        Hash256 id = resolve_token(arg_str(p, 0));
+        size_t n = size_t(std::clamp<int64_t>(arg_int(p, 1, 100), 1, 1000));
+        int d = asset_decimals(id, st);
+        json a = json::array();
+        auto it = trades_.find(id);
+        if (it != trades_.end())
+            for (auto r = it->second.rbegin(); r != it->second.rend() && a.size() < n; ++r) {
+                Amount q = r->sell ? r->out : r->in, t = r->sell ? r->in : r->out;
+                double price = t ? (double(q) / 1e10) / (double(t) / std::pow(10.0, d)) : 0;
+                a.push_back({{"height", r->height}, {"time", r->time}, {"txid", r->txid.hex()}, {"side", r->sell ? "sell" : "buy"},
+                             {"qnt", format_amount(q)}, {"tok", format_units(t, d)}, {"price_qnt", price},
+                             {"trader", encode_address(p_, 0, r->trader)}});
+            }
+        return a;
+    }
+    if (method == "listmarkets") {
+        std::string sort = arg_str(p, 0, "movers");
+        size_t n = size_t(std::clamp<int64_t>(arg_int(p, 1, 100), 1, 1000));
+        uint64_t now = uint64_t(now_seconds());
+        // Price of a pool point in QNT per whole token.
+        auto price_of = [](uint64_t q, uint64_t t, int d) { return t ? (double(q) / 1e10) / (double(t) / std::pow(10.0, d)) : 0.0; };
+        json rows = json::array();
+        for (auto& t : cs_->all_tokens()) {
+            auto pl = st.pool(t.id);
+            int d = t.decimals;
+            double supply = double(t.supply) / std::pow(10.0, d);
+            json r = {{"id", t.id.hex()}, {"ticker", t.ticker}, {"name", t.name}, {"uri", t.uri}, {"decimals", d}};
+            BlockIndex* born = cs_->at_height(int64_t(t.height));
+            r["created_time"] = born ? born->header.time : 0;
+            double price = pl ? price_of(pl->qnt, pl->tok, d) : 0;
+            r["price_qnt"] = price;
+            r["mcap_qnt"] = price * supply;
+            r["liquidity_qnt"] = pl ? 2.0 * double(pl->qnt) / 1e10 : 0.0;
+            // ATH, % change and a sparkline from the per-block pool history.
+            double ath = price, p1h = 0, p6h = 0, p24h = 0;
+            json spark = json::array();
+            auto ph = pool_hist_.find(t.id);
+            if (ph != pool_hist_.end()) {
+                for (auto& pt : ph->second) {
+                    double pr = price_of(pt.qnt, pt.tok, d);
+                    ath = std::max(ath, pr);
+                    if (pt.time <= now - 3600) p1h = pr;
+                    if (pt.time <= now - 6 * 3600) p6h = pr;
+                    if (pt.time <= now - 24 * 3600) p24h = pr;
+                }
+                auto& v = ph->second;
+                size_t start = v.size() > 24 ? v.size() - 24 : 0;
+                for (size_t i = start; i < v.size(); i++) spark.push_back(price_of(v[i].qnt, v[i].tok, d));
+                if (!v.empty()) {
+                    // Before the first point in a window: compare with the opening price.
+                    double first = price_of(v.front().qnt, v.front().tok, d);
+                    if (!p1h) p1h = first; if (!p6h) p6h = first; if (!p24h) p24h = first;
+                }
+            }
+            auto pct = [&](double old) { return old > 0 ? (price / old - 1) * 100 : 0.0; };
+            r["ath_qnt"] = ath;
+            r["change_1h"] = pct(p1h); r["change_6h"] = pct(p6h); r["change_24h"] = pct(p24h);
+            r["spark"] = spark;
+            // Trades: total count, 24h volume (QNT side) and unique traders.
+            uint64_t txns = 0, last_trade = 0;
+            double vol = 0;
+            std::set<Hash256> traders;
+            auto tr = trades_.find(t.id);
+            if (tr != trades_.end()) {
+                txns = tr->second.size();
+                for (auto& x : tr->second) {
+                    last_trade = std::max<uint64_t>(last_trade, x.time);
+                    if (x.time + 86400 < now) continue;
+                    vol += double(x.sell ? x.out : x.in) / 1e10;
+                    traders.insert(x.trader);
+                }
+            }
+            r["txns"] = txns; r["vol_24h_qnt"] = vol; r["traders_24h"] = traders.size(); r["last_trade"] = last_trade;
+            rows.push_back(r);
+        }
+        auto key = [&](const json& r) -> double {
+            if (sort == "new") return r["created_time"].get<double>();
+            if (sort == "oldest") return -r["created_time"].get<double>();
+            if (sort == "mcap") return r["mcap_qnt"].get<double>();
+            if (sort == "lasttrade") return r["last_trade"].get<double>();
+            return r["vol_24h_qnt"].get<double>() * 1e6 + std::abs(r["change_24h"].get<double>()); // movers
+        };
+        std::sort(rows.begin(), rows.end(), [&](const json& a, const json& b) { return key(a) > key(b); });
+        if (rows.size() > n) rows.erase(rows.begin() + long(n), rows.end());
+        return rows;
+    }
+    if (method == "setban" || method == "clearban" || method == "listbanned") {
+        if (!p2p_) throw RpcError("p2p disabled");
+        if (method == "listbanned") {
+            json a = json::array();
+            for (auto& b : p2p_->bans())
+                a.push_back({{"ip", b.ip}, {"until", b.until == INT64_MAX ? json(nullptr) : json(b.until)}, {"forever", b.until == INT64_MAX}, {"reason", b.reason}});
+            return a;
+        }
+        if (method == "clearban") { p2p_->unban(arg_str(p, 0)); return "unbanned"; }
+        std::string dur = arg_str(p, 1, "24h");
+        int64_t secs = dur == "forever" ? 0 : dur == "7d" ? 7 * 86400 : dur == "31d" ? 31 * 86400 : dur == "24h" ? 86400 : -1;
+        if (secs < 0) throw RpcError("duration must be 24h, 7d, 31d or forever");
+        std::string err;
+        if (!p2p_->ban(arg_str(p, 0), secs, arg_str(p, 2), &err)) throw RpcError(err);
+        return "banned";
     }
     if (method == "getpoolhistory") {
         Hash256 id = resolve_token(arg_str(p, 0));

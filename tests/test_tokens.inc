@@ -44,6 +44,13 @@ TEST(tokens_and_pool_rpc) {
         printf("  buy 10 QNT -> %s DOGE2 (impact %.2f%%); sell 20000 -> %s QNT\n", q["out"].get<std::string>().c_str(),
                q["price_impact_percent"].get<double>(), sell["out"].get<std::string>().c_str());
 
+        // Market stats and the trade list see both swaps.
+        json mk = rpc("listmarkets", json::array());
+        CHECK(mk.size() == 1 && mk[0]["txns"] == 2 && mk[0]["traders_24h"].get<int>() >= 1);
+        CHECK(mk[0]["price_qnt"].get<double>() > 0 && mk[0]["mcap_qnt"].get<double>() > 0);
+        json trs = rpc("getpooltrades", json::array({"DOGE2"}));
+        CHECK(trs.size() == 2 && trs[0]["side"] == "sell" && trs[1]["side"] == "buy");
+
         // Asking for more than the pool gives is rejected.
         auto pl = node.mempool().view().pool(tid);
         CHECK(pl.has_value());

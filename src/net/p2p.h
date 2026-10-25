@@ -41,7 +41,11 @@ struct PeerInfo {
     double ping_ms;
     uint64_t bytes_in, bytes_out;
     int inflight;
+    uint64_t blocks_sent = 0;   // blocks we uploaded to this peer
+    bool syncing_from_us = false; // far behind us: downloading the chain from us
 };
+
+struct BanInfo { std::string ip; int64_t until; std::string reason; }; // until = INT64_MAX: forever
 
 struct NetStats {
     uint64_t bytes_in = 0, bytes_out = 0;
@@ -63,6 +67,10 @@ public:
     void broadcast_tx(const Transaction& tx);   // after it's in our mempool
     void add_node(const std::string& hostport);
     void disconnect(uint64_t peer_id);
+    // Ban an IP (all ports). seconds = 0 bans forever. Persisted in bans.txt.
+    bool ban(const std::string& ip, int64_t seconds, const std::string& reason, std::string* err);
+    void unban(const std::string& ip);
+    std::vector<BanInfo> bans() const;
     std::vector<PeerInfo> peers() const;
     NetStats stats() const;
     size_t peer_count() const { return peer_count_; }
@@ -122,6 +130,12 @@ private:
     std::deque<Hash256> q_relay_;
     std::deque<std::string> q_addnode_;
     std::deque<uint64_t> q_disconnect_;
+    struct BanOp { std::array<uint8_t, 16> ip; int64_t until; std::string reason; bool remove; };
+    std::deque<BanOp> q_ban_;
+    std::map<std::array<uint8_t, 16>, std::string> ban_reason_;
+    std::vector<BanInfo> bans_info_;
+    void load_bans();
+    void save_bans();
     bool q_tip_ = false;
 
     // published snapshot

@@ -33,6 +33,7 @@ std::string default_datadir();
 class Node {
 public:
     struct PoolPoint { int64_t height; uint64_t time; Amount qnt, tok; };
+    struct TradePoint { int64_t height; uint64_t time; Hash256 txid; bool sell; Amount in, out; Hash256 trader; };
     explicit Node(NodeConfig cfg);
     ~Node();
 
@@ -88,12 +89,19 @@ private:
     std::unique_ptr<Miner> miner_;
     std::unique_ptr<Wallet> wallet_;
     int64_t wallet_saved_height_ = 0;
+    int64_t wallet_saved_time_ = 0;
     // Pool reserves after every block that touched the pool (price charts). Persisted in poolhist.dat.
     std::map<Hash256, std::vector<PoolPoint>> pool_hist_;
+    std::map<Hash256, std::vector<TradePoint>> trades_; // swaps per token, oldest first (trades.dat)
+    FILE* f_trades_ = nullptr;
     FILE* f_poolhist_ = nullptr;
     void pool_hist_load();
     void pool_hist_connect(const Block& b, const BlockIndex* idx);
     void pool_hist_disconnect(const BlockIndex* idx);
+    void trades_load();
+    void trades_compact();
+    void trades_connect(const Block& b, const BlockIndex* idx);
+    void trades_disconnect(const BlockIndex* idx);
     bool started_ = false;
     bool stop_requested_ = false;
 };

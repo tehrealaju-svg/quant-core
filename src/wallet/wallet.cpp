@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <mutex>
 #include <set>
 
 #include "consensus/limits.h"
@@ -38,10 +39,27 @@ static void keystream_xor(const Hash256& k, const uint8_t nonce[16], Bytes& data
 }
 
 static Bytes seal(const Bytes& plain, const std::string& pw) {
+    // The salt + stretched key are reused while the password stays the same (fresh nonce every
+    // time), so frequent saves don't redo 300k hash rounds.
+    static std::mutex cache_mu;
+    static std::string cache_pw;
+    static uint8_t cache_salt[16];
+    static Hash256 cache_key;
+    static bool cached = false;
     uint8_t salt[16], nonce[16];
-    os_random(salt, 16);
     os_random(nonce, 16);
-    Hash256 k = kdf(pw, salt, KDF_ROUNDS);
+    Hash256 k;
+    {
+        std::lock_guard l(cache_mu);
+        if (!cached || cache_pw != pw) {
+            os_random(cache_salt, 16);
+            cache_key = kdf(pw, cache_salt, KDF_ROUNDS);
+            cache_pw = pw;
+            cached = true;
+        }
+        std::memcpy(salt, cache_salt, 16);
+        k = cache_key;
+    }
     Hash256 ek = blake3_keyed(k, (const uint8_t*)"enc", 3);
     Hash256 mk = blake3_keyed(k, (const uint8_t*)"mac", 3);
     Bytes ct = plain;

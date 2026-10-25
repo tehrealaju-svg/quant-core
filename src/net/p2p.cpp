@@ -34,6 +34,7 @@ struct P2P::Peer {
     int64_t best_height = 0;
     uint64_t bin = 0, bout = 0;
     int stalls = 0;
+    uint64_t blocks_sent = 0;
     std::set<Hash256> known;
     std::deque<Hash256> known_order;
 
@@ -60,6 +61,7 @@ P2P::~P2P() { stop(); }
 bool P2P::start(std::string* err) {
     net_init();
     load_addrs();
+    load_bans();
     for (auto& a : opt_.addnodes) q_addnode_.push_back(a);
     if (opt_.listen) {
         std::string e;
@@ -233,6 +235,7 @@ void P2P::on_connected(Peer& p) {
 void P2P::send(Peer& p, Cmd c, const Bytes& payload) {
     if (p.disconnect || p.s == BAD_SOCK) return;
     Bytes f = frame_message(p_, c, payload);
+    if (c == Cmd::BlockMsg) p.blocks_sent++;
     if (p.tx_off > 0 && p.tx_off == p.txbuf.size()) { p.txbuf.clear(); p.tx_off = 0; }
     p.txbuf.insert(p.txbuf.end(), f.begin(), f.end());
     if (p.txbuf.size() - p.tx_off > 64 * 1024 * 1024) { p.disconnect = true; return; }
@@ -733,6 +736,7 @@ void P2P::process_queues() {
     std::deque<Hash256> relay;
     std::deque<std::string> addn;
     std::deque<uint64_t> disc;
+    std::deque<BanOp> bans;
     bool tip;
     {
         std::lock_guard l(q_mu_);
@@ -740,6 +744,7 @@ void P2P::process_queues() {
         relay.swap(q_relay_);
         addn.swap(q_addnode_);
         disc.swap(q_disconnect_);
+        bans.swap(q_ban_);
         tip = q_tip_;
         q_tip_ = false;
     }
@@ -749,6 +754,14 @@ void P2P::process_queues() {
         else logf("addnode: cannot resolve %s", s.c_str());
     }
     for (auto id : disc) for (auto& p : peers_) if (p->id == id) p->disconnect = true;
+    for (auto& b : bans) {
+        if (b.remove) { banned_.erase(b.ip); ban_reason_.erase(b.ip); }
+        else {
+            banned_[b.ip] = b.until; ban_reason_[b.ip] = b.reason;
+            for (auto& p : peers_) if (p->addr.ip == b.ip) p->disconnect = true;
+        }
+    }
+    if (!bans.empty()) save_bans();
     if (!relay.empty()) {
         for (auto& p : peers_) {
             if (!p->active()) continue;
@@ -849,8 +862,11 @@ void P2P::publish_info() {
         if (p->connecting || p->disconnect) continue;
         int inflight = 0;
         for (auto& [h, x] : inflight_) inflight += x.first == p->id;
+        int64_t our_h;
+        { std::lock_guard l(cs_.mu); our_h = cs_.height(); }
         v.push_back(PeerInfo{p->id, p->addr.str(), p->inbound, !p->full(), p->ver.agent, p->best_height,
-                             (now - p->start_ms) / 1000, p->ping_ms, p->bin, p->bout, inflight});
+                             (now - p->start_ms) / 1000, p->ping_ms, p->bin, p->bout, inflight, p->blocks_sent,
+                             p->best_height + 10 < our_h});
         if (p->active()) (p->inbound ? s.inbound : s.outbound)++;
     }
     s.bytes_in = bytes_in_;
@@ -865,8 +881,17 @@ void P2P::publish_info() {
     s.external_addr += external6_.is_zero() ? "  |  IPv6 unknown" : "  |  " + external6_.str();
     s.listening = listen_ != BAD_SOCK;
     peer_count_ = v.size();
+    std::vector<BanInfo> bl;
+    int64_t nows = now_seconds();
+    for (auto& [ip, until] : banned_) {
+        if (until <= nows) continue;
+        NetAddr a; a.ip = ip;
+        auto r = ban_reason_.find(ip);
+        bl.push_back(BanInfo{a.ip_str(), until, r == ban_reason_.end() ? "misbehaving" : r->second});
+    }
     std::lock_guard l(info_mu_);
     info_ = std::move(v);
+    bans_info_ = std::move(bl);
     stats_ = s;
 }
 
@@ -977,5 +1002,54 @@ bool P2P::try_fast_sync(int64_t now) {
         return true;
     }
     return false; // nobody serves snapshots: fall back to downloading blocks
+}
+} // namespace quant
+
+namespace quant {
+// ---------------------------------------------------------------- bans (manual, persisted)
+bool P2P::ban(const std::string& ip, int64_t seconds, const std::string& reason, std::string* err) {
+    NetAddr a;
+    if (!NetAddr::parse(ip, p_.p2p_port, a)) { if (err) *err = "not an IP address"; return false; }
+    int64_t until = seconds <= 0 ? INT64_MAX : now_seconds() + seconds;
+    std::lock_guard l(q_mu_);
+    q_ban_.push_back(BanOp{a.ip, until, reason.empty() ? "banned by you" : reason, false});
+    return true;
+}
+
+void P2P::unban(const std::string& ip) {
+    NetAddr a;
+    if (!NetAddr::parse(ip, p_.p2p_port, a)) return;
+    std::lock_guard l(q_mu_);
+    q_ban_.push_back(BanOp{a.ip, 0, "", true});
+}
+
+std::vector<BanInfo> P2P::bans() const { std::lock_guard l(info_mu_); return bans_info_; }
+
+void P2P::load_bans() {
+    std::ifstream f(opt_.datadir + "/bans.txt");
+    std::string line;
+    int64_t now = now_seconds();
+    while (std::getline(f, line)) {
+        std::istringstream is(line);
+        std::string ip, reason;
+        int64_t until = 0;
+        is >> ip >> until;
+        std::getline(is, reason);
+        NetAddr a;
+        if (until > now && NetAddr::parse(ip, p_.p2p_port, a)) {
+            banned_[a.ip] = until;
+            ban_reason_[a.ip] = reason.empty() ? "banned" : reason.substr(1);
+        }
+    }
+}
+
+void P2P::save_bans() {
+    std::ofstream f(opt_.datadir + "/bans.txt");
+    int64_t now = now_seconds();
+    for (auto& [ip, until] : banned_) {
+        if (until <= now || !ban_reason_.count(ip)) continue; // short automatic bans aren't kept
+        NetAddr a; a.ip = ip;
+        f << a.ip_str() << " " << until << " " << ban_reason_[ip] << "\n";
+    }
 }
 } // namespace quant
