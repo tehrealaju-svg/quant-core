@@ -668,7 +668,7 @@ json Node::rpc(const std::string& method, const json& params) {
             if (mp_->spends(op)) continue;
             json j = out_json(c.out, st);
             j["txid"] = op.txid.hex(); j["vout"] = op.n; j["height"] = c.height; j["coinbase"] = c.coinbase;
-            j["mature"] = !c.coinbase || cs_->height() + 1 >= int64_t(c.height) + COINBASE_MATURITY;
+            j["mature"] = !c.coinbase || cs_->height() + 1 >= int64_t(c.height) + p_.coinbase_maturity;
             coins.push_back(j);
         }
         for (auto* e : mp_->all())

@@ -329,8 +329,8 @@ std::vector<WalletCoin> Wallet::coins() const {
     return v;
 }
 
-static bool mature(const WalletCoin& c, int64_t tip) {
-    return !c.coinbase || (c.height >= 0 && tip + 1 >= c.height + COINBASE_MATURITY);
+static bool mature(const WalletCoin& c, int64_t tip, int maturity) {
+    return !c.coinbase || (c.height >= 0 && tip + 1 >= c.height + maturity);
 }
 
 Balance Wallet::balance(int64_t tip) const {
@@ -340,7 +340,7 @@ Balance Wallet::balance(int64_t tip) const {
         if (!c.out.is_qnt()) continue;
         if (c.locked) b.locked += c.out.value;
         else if (c.height < 0) b.unconfirmed += c.out.value;
-        else if (!mature(c, tip)) b.immature += c.out.value;
+        else if (!mature(c, tip, p_.coinbase_maturity)) b.immature += c.out.value;
         else b.confirmed += c.out.value;
     }
     return b;
@@ -486,7 +486,7 @@ Hash256 Wallet::change_addr() {
 
 bool Wallet::build(Plan plan, int64_t tip, Amount fee_per_kb, Transaction& out, Amount* fee_out, std::string* err) {
     if (fee_per_kb < MIN_RELAY_FEE_PER_KB) fee_per_kb = MIN_RELAY_FEE_PER_KB;
-    auto spendable = [&](const WalletCoin& c) { return !c.locked && c.height >= 0 && mature(c, tip); };
+    auto spendable = [&](const WalletCoin& c) { return !c.locked && c.height >= 0 && mature(c, tip, p_.coinbase_maturity); };
 
     // Net amount each asset needs from our coins: outputs + absorbed by ops - released by ops.
     std::map<Hash256, __int128> need;
@@ -597,7 +597,7 @@ bool Wallet::create_sweep(const std::string& address, Amount fee_per_kb, int64_t
     uint8_t v; Hash256 h;
     if (!decode_address(p_, address, v, h)) { if (err) *err = "invalid address"; return false; }
     Plan plan;
-    for (auto& [o, c] : coins_) if (c.out.is_qnt() && !c.locked && c.height >= 0 && mature(c, tip)) plan.sweep_coins.push_back(c);
+    for (auto& [o, c] : coins_) if (c.out.is_qnt() && !c.locked && c.height >= 0 && mature(c, tip, p_.coinbase_maturity)) plan.sweep_coins.push_back(c);
     if (plan.sweep_coins.empty()) { if (err) *err = "nothing to sweep"; return false; }
     plan.sweep = true;
     plan.outs.push_back(TxOut{0, QNT_ASSET, h});

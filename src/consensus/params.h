@@ -3,6 +3,7 @@
 
 #include "primitives/block.h"
 #include "util/u256.h"
+#include "consensus/limits.h"
 
 namespace quant {
 
@@ -27,12 +28,15 @@ struct ChainParams {
     uint16_t lan_port;          // UDP port for LAN discovery broadcasts
     int64_t snapshot_interval = 10080; // state snapshot every N blocks (~2 weeks)
     int64_t snapshot_delay = 100;      // committed in the header this many blocks later
+    int coinbase_maturity = COINBASE_MATURITY; // blocks before a mining reward can be spent (testnet: 10)
     bool is_commit_height(int64_t h) const { return h >= snapshot_interval + snapshot_delay && h % snapshot_interval == snapshot_delay; }
 
     std::string address_hrp() const { return hrp; }
 };
 
 const ChainParams& params_for(Network n);
+// Coinbase maturity of the network whose genesis is `genesis` (the ledger only knows the genesis).
+int maturity_for_genesis(const Hash256& genesis);
 Network network_from_name(const std::string& s, bool* ok = nullptr);
 Block make_genesis(uint64_t time, uint32_t bits, const std::string& msg);
 

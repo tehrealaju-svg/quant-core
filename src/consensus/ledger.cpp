@@ -3,6 +3,7 @@
 #include <set>
 
 #include "consensus/limits.h"
+#include "consensus/params.h"
 #include "crypto/sig.h"
 #include "util/u256.h"
 
@@ -191,7 +192,7 @@ TxResult LedgerView::apply(const Transaction& tx, uint64_t height, const Hash256
     for (auto& in : tx.ins) {
         auto c = coin(in.prev);
         if (!c) return TxResult::fail("missing-or-spent-input");
-        if (c->coinbase && height < c->height + COINBASE_MATURITY) return TxResult::fail("immature-coinbase");
+        if (c->coinbase && height < c->height + uint64_t(maturity_for_genesis(genesis))) return TxResult::fail("immature-coinbase");
         plus[c->out.asset] += c->out.value;
         coins.push_back(*c);
     }

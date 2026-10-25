@@ -99,6 +99,7 @@ static std::unique_ptr<ChainParams> build(Network n) {
         p->genesis_bits = (U256(1) << 230).to_compact();
         p->genesis_time = 1792800000; // 2026-10-24
         p->genesis_message = "Quant v2 testnet 2026-10-24";
+        p->coinbase_maturity = 10;
         break;
     case Network::Regtest:
         p->name = "regtest"; p->hrp = "rqnt";
@@ -115,6 +116,12 @@ static std::unique_ptr<ChainParams> build(Network n) {
     }
     finish(*p);
     return p;
+}
+
+int maturity_for_genesis(const Hash256& genesis) {
+    for (Network n : {Network::Main, Network::Test, Network::Regtest})
+        if (params_for(n).genesis_hash == genesis) return params_for(n).coinbase_maturity;
+    return COINBASE_MATURITY;
 }
 
 const ChainParams& params_for(Network n) {
