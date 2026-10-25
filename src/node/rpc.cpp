@@ -693,6 +693,20 @@ json Node::rpc(const std::string& method, const json& params) {
         if (p2p_) p2p_->broadcast_tx(tx);
         return tx.txid().hex();
     }
+    if (method == "faucet") {
+        // Testnet only: 1-10 QNT once per address per day, from this node's wallet.
+        if (p_.net == Network::Main) throw RpcError("no faucet on mainnet");
+        uint8_t v; Hash256 a;
+        std::string addr = arg_str(p, 0);
+        if (!decode_address(p_, addr, v, a)) throw RpcError("invalid address");
+        static std::map<Hash256, int64_t> last;
+        int64_t now = now_seconds();
+        if (auto it = last.find(a); it != last.end() && now - it->second < 86400) throw RpcError("this address already got coins today");
+        Amount amt = (1 + Amount(now % 10)) * COIN;
+        std::string id = send({{addr, amt, QNT_ASSET}}, 0, false, "faucet");
+        last[a] = now;
+        return json{{"txid", id}, {"amount", format_amount(amt)}};
+    }
     if (method == "listgifts") {
         json a = json::array();
         for (uint8_t g = 1; g < GIFT_COUNT; g++) a.push_back({{"id", g}, {"name", gift_name(g)}, {"price", format_amount(GIFT_PRICE[g])}});

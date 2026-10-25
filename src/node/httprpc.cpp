@@ -55,7 +55,7 @@ bool HttpRpcServer::public_method(const std::string& m) {
     static const char* ok[] = {"getblockchaininfo", "getblockcount", "getbestblockhash", "getblockhash", "getblock",
                                "gettransaction", "getaddressinfo", "getaddresscoins", "getmempoolinfo", "getrawmempool",
                                "listtokens", "gettoken", "getpool", "quote", "sendrawtransaction", "decoderawtransaction",
-                               "getemission", "getpoolhistory", "listmarkets", "getpooltrades", "getmessages", "listgifts", "estimatefee", "validateaddress", "getsnapshotinfo", "help"};
+                               "getemission", "getpoolhistory", "listmarkets", "getpooltrades", "getmessages", "listgifts", "faucet", "estimatefee", "validateaddress", "getsnapshotinfo", "help"};
     for (auto* s : ok) if (m == s) return true;
     return false;
 }
